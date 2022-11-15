@@ -1066,14 +1066,63 @@ class Module:
 
         return self._apply(convert)
 
+    """
+    hook方法:
+    
+        为了节省内存，pytorch在计算过程中不保存中间变量，包括中间层的特征图和非叶子张量的梯度。为了访问网络的中间变量，
+        我们需要注册hook来导出中间变量。利用它，我们可以不必改变网络输入输出的结构，方便地获取、改变网络中间层变量的值和梯度。
+    
+    Examples::
+    
+        torch.Tensor.register_hook(hook_fn)
+        
+        注册一个反向传播hook函数hook_fn，针对tensor的register_hook函数接收一个输入参数hook_fn，为自定义函数名称。
+        在每次调用backward函数之前都会先调用hook_fn函数。hook_fn函数同样接收一个输入参数，为torch.Tensor张量的梯度。
+    
+        >>> import torch
+
+        >>> # x,y 为leaf节点，也就是说，在计算的时候，PyTorch只会保留此节点的梯度值
+        >>> x = torch.tensor([3.], requires_grad=True)
+        >>> y = torch.tensor([5.], requires_grad=True)
+        
+        >>> # a,b,c 均为中间变量，在计算梯度时，此部分会被释放掉
+        >>> a = x + y
+        >>> b = x * y
+        >>> c = a * b
+        >>> # 新建列表，用于存储hook函数保存的中间梯度值
+        >>> a_grad = []
+        >>> def hook_grad(grad):
+                a_grad.append(grad)
+        
+        >>> # register_hook的参数为一个函数
+        >>> handle = a.register_hook(hook_grad)
+        >>> c.backward()
+        
+        >>> # 只有leaf节点才会有梯度值
+        >>> print('gradient:', x.grad, y.grad, a.grad, b.grad, c.grad)
+        >>> # hook函数保留中间变量a的梯度值
+        >>> print('hook函数保留中间变量a的梯度值:', a_grad[0])
+        >>> # 移除hook函数
+        >>> handle.remove()
+        
+        gradient: tensor([55.]) tensor([39.]) None None None
+        hook函数保留中间变量a的梯度值: tensor([15.])
+        
+    """
     def register_backward_hook(
             self, hook: Callable[['Module', _grad_t, _grad_t], Union[None, Tensor]]
     ) -> RemovableHandle:
+        """
+            网络在进行反向传播时，可以通过register_backward_hook来获取中间层的梯度输入和输出，常用来实现特征图梯度的提取。
+        """
+
         r"""Registers a backward hook on the module.
+            在该模块注册一个反向传播hook
 
         This function is deprecated in favor of :meth:`~torch.nn.Module.register_full_backward_hook` and
         the behavior of this function will change in future versions.
-
+        不推荐使用方法：`~torch.nn.Module.register_full_backward_hook`，并且这个函数的功能将在未来的版本中改变
+        
         Returns:
             :class:`torch.utils.hooks.RemovableHandle`:
                 a handle that can be used to remove the added hook by calling
@@ -1081,8 +1130,10 @@ class Module:
 
         """
         if self._is_full_backward_hook is True:
+            # 不能在同一个模块同时使用常规后向传播hooks和全后向传播hooks，请仅使用他们中的一个
             raise RuntimeError("Cannot use both regular backward hooks and full backward hooks on a "
                                "single Module. Please use only one of them.")
+
 
         self._is_full_backward_hook = False
 
@@ -1094,6 +1145,7 @@ class Module:
             self, hook: Callable[['Module', _grad_t, _grad_t], Union[None, Tensor]]
     ) -> RemovableHandle:
         r"""Registers a backward hook on the module.
+            在该模块注册一个反向传播hook
 
         The hook will be called every time the gradients with respect to module
         inputs are computed. The hook should have the following signature::
@@ -1196,6 +1248,66 @@ class Module:
                               "behavior.")
 
     def register_forward_pre_hook(self, hook: Callable[..., None]) -> RemovableHandle:
+        """
+        功能：
+            用来导出或修改指定子模型的输入张量，需要使用return返回修改后的output值使操作生效。
+
+        用法：
+            在神经网络模型module上注册一个forward_pre_hook函数hook_fn，register_forward_pre_hook函数接收一个输入参数hook_fn，为自定义函数名称。
+            注：在调用hook_fn函数的那个模型（层）进行前向传播操作之前会先执行hook_fn函数，因此修改input值会对该层的操作产生影响，该层的运算结果被继续向前传递。
+            hook_fn函数接收两个输入参数：module，input，其中module为当前网络层，input为当前网络层输入数据。
+            下面代码执行的功能是 3 × 3 3 \times 33×3 的卷积和 2 × 2 2 \times 22×2 的池化。我们使用register_forward_pre_hook函数修改中间卷积层输入的张量。
+
+        Example::
+            >>> import torch
+            >>> import torch.nn as nn
+
+            >>> class Net(nn.Module):
+                >>> def __init__(self):
+                    >>> super(Net, self).__init__()
+                    >>> self.conv1 = nn.Conv2d(1, 2, 3)
+                    >>> self.pool1 = nn.MaxPool2d(2, 2)
+
+                >>> def forward(self, x):
+                    >>> print("-------------执行forward函数-------------")
+                    >>> print("卷积层输入：",x)
+                    >>> x = self.conv1(x)
+                    >>> print("卷积层输出：",x)
+                    >>> x = self.pool1(x)
+                    >>> print("池化层输出：",x)
+                    >>> print("-------------结束forward函数-------------")
+                    >>> return x
+
+            >>> # module为net.conv1
+            >>> # data_input为net.conv1层输入
+            >>> def forward_pre_hook(module, data_input):
+                >>> print("-------------执行forward_pre_hook函数-------------")
+                >>> input_block.append(data_input)
+                >>> #print("修改前的卷积层输入：{}".format(data_input))
+                >>> #data_input = torch.rand((1, 1, 4, 4))
+                >>> #print("修改后的卷积层输入：{}".format(data_input))
+                >>> print("-------------结束forward_pre_hook函数-------------")
+                >>> #return data_input
+
+            >>> # 初始化网络
+            >>> net = Net()
+            >>> net.conv1.weight[0].detach().fill_(1)
+            >>> net.conv1.weight[1].detach().fill_(2)
+            >>> net.conv1.bias.data.detach().zero_()
+
+            >>> # 注册hook
+            >>> input_block = list()
+            >>> handle = net.conv1.register_forward_pre_hook(forward_pre_hook)
+
+            >>> # inference
+            >>> fake_img = torch.ones((1, 1, 4, 4))  # batch size * channel * H * W
+            >>> output = net(fake_img)
+            >>> handle.remove()
+
+            >>> # 观察
+            >>> print("神经网络模型输出：output shape: {} output value: {}".format(output.shape, output))
+        """
+
         r"""Registers a forward pre-hook on the module.
 
         The hook will be called every time before :func:`forward` is invoked.
@@ -1219,6 +1331,48 @@ class Module:
         return handle
 
     def register_forward_hook(self, hook: Callable[..., None]) -> RemovableHandle:
+        """
+        用法：
+            在神经网络模型module上注册一个forward_hook函数hook_fn，register_forward_hook函数接收一个输入参数hook_fn，
+            为自定义函数名称。注：在调用hook_fn函数的那个模型（层）进行前向传播并计算得到结果之后才会执行hook_fn函数，
+            因此修改output值仅会对后续操作产生影响。hook_fn函数接收三个输入参数：module，input，output，其中module为当前网络层，
+            input为当前网络层输入数据，output为当前网络层输出数据。
+
+        Examples::
+            >>> import timm
+            >>> import torch
+            >>> from torch import nn
+
+            >>> def print_shape(model, input, output):
+                    >>> print(model)
+                    >>> print(input[0].shape, '=>', output.shape)
+                    >>> print('====================================')
+
+
+            >>> def get_children(model: nn.Module):
+                    >>> # get children from model(取出所有子model及嵌套model)
+                    >>> children = list(model.children())
+                    >>> flatt_children = []
+                    >>> if children == []:
+                        >>> return model
+                    >>> else:
+                        >>> for child in children:
+                            >>> try:
+                                >>> flatt_children.extend(get_children(child))
+                            >>> except TypeError:
+                                >>> flatt_children.append(get_children(child))
+                    >>> return flatt_children
+
+            >>> model_name = 'vgg11'
+            >>> model = timm.create_model(model_name, pretrained=True)
+            >>> flatt_children = get_children(model)
+            >>> for layer in flatt_children:
+                    >>> layer.register_forward_hook(print_shape)
+
+            >>> batch_input = torch.randn(4,3,299,299)
+            >>> model(batch_input)
+
+        """
         r"""Registers a forward hook on the module.
 
         The hook will be called every time after :func:`forward` has computed an output.
@@ -1457,14 +1611,17 @@ class Module:
         r"""Saves module state to `destination` dictionary, containing a state
         of the module, but not its descendants. This is called on every
         submodule in :meth:`~torch.nn.Module.state_dict`.
+        保存模块状态到'目标'字典，包含一个状态模块的，而不是它的子模块。在方法`~torch.nn.Module.state_dict`每个子模块被调用
 
         In rare cases, subclasses can achieve class-specific behavior by
         overriding this method with custom logic.
+        在极少数情况下，使用自定义逻辑重写此方法后子类可以实现特定类的行为
 
         Args:
             destination (dict): a dict where state will be stored
-            prefix (str): the prefix for parameters and buffers used in this
-                module
+            存储当前状态的字典
+            prefix (str): the prefix for parameters and buffers used in this module
+            用于此模块的参数和缓冲区的前缀
         """
         for name, param in self._parameters.items():
             if param is not None:
@@ -1491,35 +1648,64 @@ class Module:
     # TODO: Change `*args` to `*` and remove the copprespinding warning in docs when BC allows.
     # Also remove the logic for arg parsing together.
     def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
+        """
+        作用：state_dict()常用于保存模型参数。
+
+            返回包含模块整个状态的字典。 包括参数和持久缓冲区（例如运行平均值）。
+            键是对应的参数和缓冲区名称。不包括设置为 None 的参数和缓冲区。
+
+        Example::保存模型例子
+            >>> # Additional information
+            >>> EPOCH = 5
+            >>> PATH = "model.pt"
+            >>> LOSS = 0.4
+
+            >>> torch.save({
+                        'epoch': EPOCH,
+                        'model_state_dict': net.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': LOSS,
+                        }, PATH)
+
+        """
         r"""Returns a dictionary containing a whole state of the module.
             返回包含整个模块状态的字典。
 
         Both parameters and persistent buffers (e.g. running averages) are
         included. Keys are corresponding parameter and buffer names.
         Parameters and buffers set to ``None`` are not included.
-        **参数和持久缓冲区(**例如运行平均值)都包括在内。键是相应的参数和缓冲区名称。
+        包括参数和持久缓冲区（例如运行平均值）。键是对应的参数和缓冲区名称。
+        不包括设置为 None 的参数和缓冲区。常用于保存模型参数。
 
         .. warning::
             Currently ``state_dict()`` also accepts positional arguments for
             ``destination``, ``prefix`` and ``keep_vars`` in order. However,
             this is being deprecated and keyword arguments will be enforced in
             future releases.
+            目前state_dict() 也接受的位置参数"destination" ， "prefix" 和 "keep_vars"依次排列。
+            然而，关键字将在未来的版本中被强制删除
 
         .. warning::
             Please avoid the use of argument ``destination`` as it is not
             designed for end-users.
+            请避免使用实参“destination”，因为它不是为终端用户设计。
 
         Args:
             destination (dict, optional): If provided, the state of module will
                 be updated into the dict and the same object is returned.
                 Otherwise, an ``OrderedDict`` will be created and returned.
                 Default: ``None``.
+                如果提供，则模块的状态将被更新到字典中并返回相同的对象。
+                否则，将创建并返回一个' ' OrderedDict ' '。默认值:' '没有' '。
             prefix (str, optional): a prefix added to parameter and buffer
                 names to compose the keys in state_dict. Default: ``''``.
+                添加到参数和缓冲区的前缀在state_dict中组成键的名称。默认值:``''``
             keep_vars (bool, optional): by default the :class:`~torch.Tensor` s
                 returned in the state dict are detached from autograd. If it's
                 set to ``True``, detaching will not be performed.
                 Default: ``False``.
+                默认情况下:class:`~torch。张量的在状态字典中返回的都与autograd分离。
+                如果它是设置为' ' True ' '时，将不执行分离。默认值:' 'False' '。
 
         Returns:
             dict:
@@ -1712,6 +1898,29 @@ class Module:
 
     def load_state_dict(self, state_dict: Mapping[str, Any],
                         strict: bool = True):
+        """
+        作用：
+            load_state_dict()常用于加载模型参数和缓冲区,并复制到此模块及其子模块中。
+
+            将 state_dict 中的参数(parameters)和缓冲区(buffers)复制到此模块及其子模块中。
+            如果 strict 为 True，则 state_dict 的键必须与该模块的 state_dict() 函数返回的键完全匹配。
+
+        Example::加载模型例子
+            >>> model = Net()
+            >>> optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+
+            >>> checkpoint = torch.load(PATH)
+            >>> model.load_state_dict(checkpoint['model_state_dict'])
+            >>> optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            >>> epoch = checkpoint['epoch']
+            >>> loss = checkpoint['loss']
+
+            >>> model.eval()
+            >>> # - or -
+            >>> model.train()
+
+        """
+
         r"""Copies parameters and buffers from :attr:`state_dict` into
         this module and its descendants. If :attr:`strict` is ``True``, then
         the keys of :attr:`state_dict` must exactly match the keys returned
