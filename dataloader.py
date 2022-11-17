@@ -1,8 +1,8 @@
-************************************************************************************
+#************************************************************************************
 ################################ fetch.py ##########################################
-************************************************************************************
+#************************************************************************************
 
-r""""Contains definitions of the methods used by the _BaseDataLoaderIter to fetch
+r"""Contains definitions of the methods used by the _BaseDataLoaderIter to fetch
 data from an iterable-style or map-style dataset. This logic is shared in both
 single- and multi-processing data loading.
 """
@@ -48,16 +48,17 @@ class _MapDatasetFetcher(_BaseDatasetFetcher):
     def __init__(self, dataset, auto_collation, collate_fn, drop_last):
         super(_MapDatasetFetcher, self).__init__(dataset, auto_collation, collate_fn, drop_last)
 
-    def fetch(self, possibly_batched_index):
-        if self.auto_collation:
+    def fetch(self, possibly_batched_index):    # batch_sample返回的是索引，通过该方法获取每个batch的值
+        if self.auto_collation: # self.batch_sampler一般为True
             data = [self.dataset[idx] for idx in possibly_batched_index]
         else:
             data = self.dataset[possibly_batched_index]
-        return self.collate_fn(data)
+        return self.collate_fn(data)    # 调用collate_fn()对batch数据进行后处理，并返回
 
-******************************************************************************
+
+#******************************************************************************
 ################################ collate.py ##################################
-******************************************************************************
+#******************************************************************************
 
 r""""Contains definitions of the methods used by the _BaseDataLoaderIter workers to
 collate samples fetched from dataset into Tensor(s).
@@ -249,11 +250,11 @@ def default_collate(batch):
                 return [default_collate(samples) for samples in transposed]
 
     raise TypeError(default_collate_err_msg_format.format(elem_type))
-    
 
-******************************************************************************************
+
+#******************************************************************************************
 ##################################### sampler.py #########################################
-******************************************************************************************
+#******************************************************************************************
 
 
 """
@@ -547,9 +548,9 @@ class BatchSampler(Sampler[List[int]]):
         else:
             return (len(self.sampler) + self.batch_size - 1) // self.batch_size  # type: ignore[arg-type]
 
-******************************************************************************************
+#******************************************************************************************
 ##################################### dataloader.py ######################################
-******************************************************************************************
+#******************************************************************************************
 
 r"""Definition of the DataLoader and associated iterators that subclass _BaseDataLoaderIter
 
@@ -764,8 +765,11 @@ class DataLoader(Generic[T_co]):
         6、num_workers (int, optional)：这个参数决定了有几个进程来处理data loading。
             0意味着所有的数据都会被load进主进程。（默认为0）
         7、collate_fn (callable, optional)：将一个list的sample组成一个mini-batch的函数
-        8、pin_memory (bool, optional)：如果设置为True，那么data loader将会在返回它们之前，
-            将tensors拷贝到CUDA中的固定内存（CUDA pinned memory）中.
+        8、pin_memory (bool, optional)：如果设置为True，那么data loader将会在返回它们之前，将tensors拷贝到CUDA中的固定内存（CUDA pinned memory）中.
+            pin_memory就是锁页内存，创建DataLoader时，设置pin_memory=True，则意味着生成的Tensor数据最开始是属于内存中锁页内存，这样将内存的Tensor转义到GPU的显存就会更快一些。
+            主机中的内存，有两种存在方法，一是锁页，二是不索页，锁页内存存放的内容在任何情况下都不会与主机的虚拟内存进行交换（注：虚拟内存就是硬盘），而不锁页内存在主机内存不足时，数据会存放在虚拟内存中。
+            显卡中的显存全部是锁页内存，当计算机的内存充足的时候，可以设置pin_memory=True。当系统卡主，或者内存使用过多的时候，设置pin_memory=False。
+            因为pin_memory与电脑硬件性能有关，pytorch开发者不能确定每一个炼丹玩家都有高端设备，因此pin_memory默认设置为False.
         9、drop_last (bool, optional)：如果设置为True：这个是对最后的未完成的batch来说的，比如你的batch_size设置为64，
             而一个epoch只有100个样本，那么训练的时候后面的36个就被扔掉了。 
             如果为False（默认），那么会继续正常执行，只是最后的batch_size会小一点。
@@ -776,6 +780,7 @@ class DataLoader(Generic[T_co]):
         12、persistent_workers (bool, optional):如果为True，数据加载器将不会在数据集运行完一个Epoch后关闭worker进程。这允许维护worker数据集实例保持激活。(默认值:False)
             意思是运行完一个Epoch后并不会关闭worker进程，而是保持现有的worker进程继续进行下一个Epoch的数据加载。好处是Epoch之间不必重复关闭启动worker进程，加快训练速度。
             这样对训练精度是否有影响？True和False的结果似乎会略有差异。
+        13、pin_memory_device (str, optional): 如果pin_memory设置为true，数据加载器将把张量拷贝到设定的设备固定内存中，然后返回它们。
     
     .. warning:: If the ``spawn`` start method is used, :attr:`worker_init_fn`
                  cannot be an unpicklable object, e.g., a lambda function. See
@@ -972,19 +977,20 @@ class DataLoader(Generic[T_co]):
                 sampler = _InfiniteConstantSampler()
             else:  # map-style
                 if shuffle: # 如果需要自定义样本采样器更改此逻辑代码即可
+                    # 类RandomSampler和SequentialSampler采样器的__iter__()方法生成样本索引生成器
                     sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
                 else:
                     sampler = SequentialSampler(dataset)  # type: ignore[arg-type]
 
         if batch_size is not None and batch_sampler is None:
             # auto_collation without custom batch_sampler
-            # 这里只是实例化BatchSampler类，并没有调用类方法，所以并不会返回一个包含多个batch的迭代器（需要调用__iter__放法）
+            # 这里只是实例化BatchSampler类，并没有调用类方法，所以并不会返回一个包含多个batch的迭代器（需要调用__iter__方法）
             batch_sampler = BatchSampler(sampler, batch_size, drop_last)
 
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.sampler = sampler
-        self.batch_sampler = batch_sampler
+        self.batch_sampler = batch_sampler # 将batch_sampler设为Dataloader成员变量
         self.generator = generator
 
         if collate_fn is None:
@@ -1253,7 +1259,8 @@ class _BaseDataLoaderIter(object):
         self._IterableDataset_len_called = loader._IterableDataset_len_called
         self._auto_collation = loader._auto_collation
         self._drop_last = loader.drop_last
-        # _index_sampler是类Dataloader的一个装饰器方法属性，返回self.batch_sampler（BatchSampler实例对象）
+        # _index_sampler是类Dataloader的一个装饰器属性方法，返回self.batch_sampler
+        # 将loader.batch_sampler设为类_BaseDataLoaderIter成员变量self._index_sampler（batch_sampler有__iter__()方法）
         self._index_sampler = loader._index_sampler
         self._num_workers = loader.num_workers
         self._prefetch_factor = loader.prefetch_factor
@@ -1274,7 +1281,8 @@ class _BaseDataLoaderIter(object):
             self._pin_memory_device = loader.pin_memory_device
         self._timeout = loader.timeout
         self._collate_fn = loader.collate_fn
-        self._sampler_iter = iter(self._index_sampler)  # iter将self._index_sampler变为一个可迭代对象
+        # iter()将self._index_sampler转变为一个可迭代对象，并将其赋值给类_BaseDataLoaderIter成员变量self._sampler_iter
+        self._sampler_iter = iter(self._index_sampler)
         self._base_seed = torch.empty((), dtype=torch.int64).random_(generator=loader.generator).item()
         self._persistent_workers = loader.persistent_workers
         self._num_yielded = 0
@@ -1293,7 +1301,7 @@ class _BaseDataLoaderIter(object):
             shared_rng.manual_seed(self._shared_seed)
             self._dataset = torch.utils.data.graph_settings.apply_shuffle_seed(self._dataset, shared_rng)
 
-    def _next_index(self):
+    def _next_index(self):  # 返回batch_sampler可迭代对象中的一个batch
         return next(self._sampler_iter)  # may raise StopIteration
 
     def _next_data(self):
@@ -1350,7 +1358,7 @@ class _SingleProcessDataLoaderIter(_BaseDataLoaderIter):
         data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
         if self._pin_memory:
             data = _utils.pin_memory.pin_memory(data, self._pin_memory_device)
-        return data # 逐一返回batch单元
+        return data # 逐一返回
 
 
 class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
