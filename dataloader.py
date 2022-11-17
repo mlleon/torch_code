@@ -1,3 +1,7 @@
+************************************************************************************
+################################ fetch.py ##########################################
+************************************************************************************
+
 r""""Contains definitions of the methods used by the _BaseDataLoaderIter to fetch
 data from an iterable-style or map-style dataset. This logic is shared in both
 single- and multi-processing data loading.
@@ -51,8 +55,9 @@ class _MapDatasetFetcher(_BaseDatasetFetcher):
             data = self.dataset[possibly_batched_index]
         return self.collate_fn(data)
 
-
-#################################################################
+******************************************************************************
+################################ collate.py ##################################
+******************************************************************************
 
 r""""Contains definitions of the methods used by the _BaseDataLoaderIter workers to
 collate samples fetched from dataset into Tensor(s).
@@ -244,9 +249,11 @@ def default_collate(batch):
                 return [default_collate(samples) for samples in transposed]
 
     raise TypeError(default_collate_err_msg_format.format(elem_type))
+    
 
-
-################################################################################
+******************************************************************************************
+##################################### sampler.py #########################################
+******************************************************************************************
 
 
 """
@@ -540,8 +547,9 @@ class BatchSampler(Sampler[List[int]]):
         else:
             return (len(self.sampler) + self.batch_size - 1) // self.batch_size  # type: ignore[arg-type]
 
-
-##################################################################
+******************************************************************************************
+##################################### dataloader.py ######################################
+******************************************************************************************
 
 r"""Definition of the DataLoader and associated iterators that subclass _BaseDataLoaderIter
 
