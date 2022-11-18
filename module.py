@@ -266,6 +266,7 @@ class Module:
     """
     继承 nn.Module 的神经网络模块在实现自己的 __init__ 函数时，一定要先调用 super().__init__()。
     只有这样才能正确地初始化自定义的神经网络模块，否则会缺少上面代码中的成员变量而导致模块被调用时出错。
+    
     实际上，如果没有提前调用 super().__init__()，在增加模块的 parameter 或者 buffer 的时候，
     被调用的 __setattr__ 函数也会检查出父类 nn.Module 没被正确地初始化并报错。
     """
@@ -275,25 +276,27 @@ class Module:
         Initializes internal Module state, shared by both nn.Module and ScriptModule.
         初始化由 nn.Module 和 ScriptModule 共享的内部模块状态
         """
+
+        # 这一行代码是 PyTorch 1.7 的新功能，可用于监测并记录 API 的调用
         torch._C._log_api_usage_once("python.nn_module")
 
-        self.training = True
-        self._parameters: Dict[str, Optional[Parameter]] = OrderedDict()
-        self._buffers: Dict[str, Optional[Tensor]] = OrderedDict()
+        self.training = True    # 控制 training/testing 状态
+        self._parameters: Dict[str, Optional[Parameter]] = OrderedDict()    # 在训练过程中会随着 BP 而更新的参数
+        self._buffers: Dict[str, Optional[Tensor]] = OrderedDict()  # 在训练过程中不会随着 BP 而更新的参数
         self._non_persistent_buffers_set: Set[str] = set()
-        self._backward_hooks: Dict[int, Callable] = OrderedDict()
+        self._backward_hooks: Dict[int, Callable] = OrderedDict()   # Backward 完成后会被调用的 hook
         self._is_full_backward_hook = None
-        self._forward_hooks: Dict[int, Callable] = OrderedDict()
-        self._forward_pre_hooks: Dict[int, Callable] = OrderedDict()
-        self._state_dict_hooks: Dict[int, Callable] = OrderedDict()
-        self._load_state_dict_pre_hooks: Dict[int, Callable] = OrderedDict()
+        self._forward_hooks: Dict[int, Callable] = OrderedDict()    # Forward 完成后会被调用的 hook
+        self._forward_pre_hooks: Dict[int, Callable] = OrderedDict()    # Forward 前会被调用的 hook
+        self._state_dict_hooks: Dict[int, Callable] = OrderedDict()     # 得到 state_dict 以后会被调用的 hook
+        self._load_state_dict_pre_hooks: Dict[int, Callable] = OrderedDict()    # load state_dict 前会被调用的 hook
         self._load_state_dict_post_hooks: Dict[int, Callable] = OrderedDict()
-        self._modules: Dict[str, Optional['Module']] = OrderedDict()
+        self._modules: Dict[str, Optional['Module']] = OrderedDict()    # 子神经网络模块
 
     forward: Callable[..., Any] = _forward_unimplemented
 
     """
-        属性设置
+        属性设置方法：
     
         对 nn.Module 属性的修改有以下三个函数，函数以及对应功能如下
     
@@ -305,7 +308,7 @@ class Module:
             这 3 个函数都会先检查 self.__dict__ 中是否包含对应的属性字典以确保 nn.Module 被正确初始化，然后检查属性的 name 是否合法，
             如不为空 string 且不包含“.”，同时还会检查他们是否已经存在于要修改的属性字典中。
         4、在日常的代码开发过程中，更常见的用法是直接通过 self.xxx = xxx 的方式来增加或修改子神经网络模块、parameters、
-            buffers 以及其他一般的 attribute。这种方式本质上会调用 nn.Module 重载的函数 __setattr__ 
+            buffers 以及其他一般的 attribute。这种方式本质上是调用 nn.Module.__setattr__ 方法
 
     """
     def register_buffer(self, name: str, tensor: Optional[Tensor], persistent: bool = True) -> None:
@@ -358,10 +361,11 @@ class Module:
             raise RuntimeError("ScriptModule does not support non-persistent buffers")
 
         if '_buffers' not in self.__dict__:
+            # 调用 Module.__init__()之前无法分配缓冲区
             raise AttributeError(
                 "cannot assign buffer before Module.__init__() call")
-            # 在调用 Module. _ _ init _ _ ()之前无法分配缓冲区
         elif not isinstance(name, torch._six.string_classes):
+            # buffer名称应该是一个字符串
             raise TypeError("buffer name should be a string. "
                             "Got {}".format(torch.typename(name)))
         elif '.' in name:
@@ -376,7 +380,7 @@ class Module:
                             .format(torch.typename(tensor), name))
         else:
             self._buffers[name] = tensor
-            # 如果 buffer 不是 persistant 的，还会同时更新到 self._non_persistent_buffers_set 中
+            # 如果 persistant=False ，新增加的buffer还会同时更新到 self._non_persistent_buffers_set 中
             if persistent:
                 self._non_persistent_buffers_set.discard(name)
             else:
@@ -419,14 +423,45 @@ class Module:
             raise TypeError("cannot assign '{}' object to parameter '{}' "
                             "(torch.nn.Parameter or None required)"
                             .format(torch.typename(param), name))
+            """
+            Example::(param.grad_fn用法举例：)
+                # grad_fn用来记录变量是怎么来的，方便计算梯度。如，y = x*3, grad_fn记录了y由x计算的过程。
+                # 如果param.grad_fn=True，说明参数是一个中间节点，不是一个叶节点
+                
+                >>> import torch
+                
+                >>> x = torch.tensor(1., requires_grad=True)
+                >>> print(f"x的值: {x} ")
+                >>> print(f"追踪x的计算过程: {x.grad_fn} ")
+                >>> print(f"x是否在计算中保留了对应的梯度信息: {x.requires_grad} \n")
+                x的值: 1.0 
+                追踪x的计算过程: None 
+                x是否在计算中保留了对应的梯度信息: True 
+                
+                >>> y = x ** 2
+                >>> print(f"y的值: {y} ")
+                >>> print(f"追踪y的计算过程: {y.grad_fn} ")
+                >>> print(f"y是否在计算中保留了对应的梯度信息: {y.requires_grad} \n")
+                y的值: 1.0 
+                追踪y的计算过程: <PowBackward0 object at 0x7fe1d07c5fd0> 
+                y是否在计算中保留了对应的梯度信息: True 
+                
+                >>> z = y + 1
+                >>> print(f"z的值: {z} ")
+                >>> print(f"追踪z的计算过程: {z.grad_fn} ")
+                >>> print(f"z是否在计算中保留了对应的梯度信息: {z.requires_grad} \n")
+                z的值: 2.0 
+                追踪z的计算过程: <AddBackward0 object at 0x7fe1d07d9ca0> 
+                z是否在计算中保留了对应的梯度信息: True 
+            """
         elif param.grad_fn:
-            # grad_fn用来记录变量是怎么来的，方便计算梯度。如，y = x*3, grad_fn记录了y由x计算的过程。
-            # 如果param.grad_fn=True，说明参数是一个中间节点，不是一个叶节点
             raise ValueError(
                 "Cannot assign non-leaf Tensor to parameter '{0}'. Model "
                 "parameters must be created explicitly. To express '{0}' "
                 "as a function of another Tensor, compute the value in "
                 "the forward() method.".format(name))
+                # 不能给非叶节点张量分配给参数{name}。模型参数必须被显式创建
+                # 要将参数name表示为另一个张量的函数，请在forward()方法中计算其值。
 
         else:
             self._parameters[name] = param
@@ -441,6 +476,7 @@ class Module:
         Args:
             name (string): name of the child module. The child module can be
                 accessed from this module using the given name
+                子模块的名字，可以使用子模块名字访问该子模块
             module (Module): child module to be added to the module.
         """
         if not isinstance(module, Module) and module is not None:
@@ -459,13 +495,13 @@ class Module:
 
     def register_module(self, name: str, module: Optional['Module']) -> None:
         r"""Alias for :func:`add_module`."""
-        self.add_module(name, module)
+        self.add_module(name, module)   # 感觉add_module()方法有点多余，可以和register_module()方法合并在一起
 
     def get_submodule(self, target: str) -> "Module":
         """
         Returns the submodule given by ``target`` if it exists,
         otherwise throws an error.
-        如果target给出的子模块存在，则返回子模块，否则抛出错误
+        如果target（子模块全路径字符串）存在，则返回子模块，否则抛出错误
 
         For example, let's say you have an ``nn.Module`` ``A`` that
         looks like this:
@@ -517,8 +553,9 @@ class Module:
         if target == "":
             return self
 
+        # 使用断点符"."拆分子模块全路径名称,如net_b.net_c.conv >> ["net_b", "net_c", "conv"]
         atoms: List[str] = target.split(".")
-        mod: torch.nn.Module = self
+        mod: torch.nn.Module = self     # 将当前模型简写为名称mod
 
         for item in atoms:
 
@@ -528,7 +565,7 @@ class Module:
 
             mod = getattr(mod, item)  # 获取对应子模块名称的子模块
 
-            if not isinstance(mod, torch.nn.Module):  # 判断mod是否继承自nn.Moudle
+            if not isinstance(mod, torch.nn.Module):  # 判断mod是否是一个Module模型
                 raise AttributeError("`" + item + "` is not "
                                                   "an nn.Module")
 
@@ -671,22 +708,35 @@ class Module:
             self._apply(lambda t: t.cuda(device))
         """
         for module in self.children():
-            module._apply(fn) # 对子模块调用fn方法
-
+            module._apply(fn) # 对子模块递归调用fn方法
+        """
+            在PyTorch 1.1.0之前，学习率调度程序应该在优化器更新之前调用；1.1.0以一种BC-breaking的方式改变了这种行为。
+            如果您在优化器更新（调用optimizer.step()）之前使用学习率调度程序（调用scheduler.step()），这将跳过学习率调度程序的第一个值。
+            如果您在升级到PyTorch 1.1.0之后无法复制结果，请检查是否在错误的时间调用了scheduler.step()。
+        """
+        #   为了 BC-breaking 而新增了一个 tensor 类型判断
         def compute_should_use_set_data(tensor, tensor_applied):
             if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
                 # If the new tensor has compatible tensor type as the existing tensor,
+                # 如果新的张量有兼容的张量类型作为现有的张量
                 # the current behavior is to change the tensor in-place using `.data =`,
+                # 当前的行为是使用".data="就地更改张量
                 # and the future behavior is to overwrite the existing tensor. However,
+                # 并且未来的行为是重写这个已经存在的张量
                 # changing the current behavior is a BC-breaking change, and we want it
+                # 然而，改变当前的行为是一个BC-breaking改变
                 # to happen in future releases. So for now we introduce the
+                # 我们希望它在未来的版本中出现
                 # `torch.__future__.get_overwrite_module_params_on_conversion()`
+                # 所以现在我们引入`torch.__future__.get_overwrite_module_params_on_conversion()`
                 # global flag to let the user control whether they want the future
                 # behavior of overwriting the existing tensor or not.
+                # 全局标志，让用户控制他们未来是否想要重写现有张量的。
                 return not torch.__future__.get_overwrite_module_params_on_conversion()
             else:
                 return False
 
+        # 处理参数及其gradint
         for key, param in self._parameters.items():
             if param is None:
                 continue
@@ -716,15 +766,16 @@ class Module:
                     assert param.grad.is_leaf
                     out_param.grad = grad_applied.requires_grad_(param.grad.requires_grad)
 
+        # 处理 buffers
         for key, buf in self._buffers.items():
             if buf is not None:
                 self._buffers[key] = fn(buf)
 
         return self
 
-    """
-        apply 函数 与 _apply() 函数不同的是，apply 函数只是简单地递归调用了 self.children() 去处理自己以及子模块.
-    """
+        """
+            apply 函数 与 _apply() 函数不同的是，apply 函数只是简单地递归调用了 self.children() 去处理自己以及子模块.
+        """
     def apply(self: T, fn: Callable[['Module'], None]) -> T:
         r"""Applies ``fn`` recursively to every submodule (as returned by ``.children()``)
         as well as self. Typical use includes initializing the parameters of a model
@@ -2233,7 +2284,7 @@ class Module:
 
             >>> l = nn.Linear(2, 2)
             >>> net = nn.Sequential(l, l)
-            >>> for idx, m in enumerate(net.named_modules()):
+                >>> for idx, m in enumerate(net.named_modules()):
                     print(idx, '->', m)
 
             0 -> ('', Sequential(
@@ -2381,6 +2432,16 @@ class Module:
         return self._apply(lambda t: t.share_memory_())
 
     def _get_name(self):
+        """
+            >>> import torch.nn as nn
+            >>> class Model(nn.Module):
+                >>> def __init__(self):
+                    >>> super().__init__()
+            # __class__是类的一个内置属性，表示类的类型，返回<type ‘type’>，也是类的实例属性，表示实例对象的所属的父类
+            >>> Model.__class__ # 结果：type，（表示类的类型，返回<type ‘type’> ）
+            >>> Model().__class__ # 结果：__main__.Model，类的实例属性，表示实例对象的所属的父类
+            >>> Model().__class__.__name__ # 结果：'Model'
+        """
         return self.__class__.__name__
 
     def extra_repr(self) -> str:
