@@ -553,7 +553,7 @@ class Module:
         if target == "":
             return self
 
-        # 使用断点符"."拆分子模块全路径名称,如net_b.net_c.conv >> ["net_b", "net_c", "conv"]
+        # 使用分隔符"."拆分子模块全路径名称,如net_b.net_c.conv >> ["net_b", "net_c", "conv"]
         atoms: List[str] = target.split(".")
         mod: torch.nn.Module = self     # 将当前模型简写为名称mod
 
@@ -707,16 +707,31 @@ class Module:
             但是 apply 函数是“公有”接口 。apply 实际上可以通过修改 fn 来实现 _apply 能实现的功能，同时还可以实现其他功能。
             self._apply(lambda t: t.cuda(device))
         """
+        """
+        其实遍历parameter，用apply也是可以实现的，不过这里还是重新写了一个_apply。
+        _apply对参数和参数的梯度都用fn处理了一遍。
+        处理完还需要用compute_should_use_set_data判断一下，是否需要替换原先的参数。
+        """
+        # 对所有子module递归调用_apply()方法
         for module in self.children():
-            module._apply(fn) # 对子模块递归调用fn方法
+            # 对子模块递归调用fn方法,如lambda t: t.cuda(device)方法将模型转移到GPU
+            module._apply(fn)
         """
             在PyTorch 1.1.0之前，学习率调度程序应该在优化器更新之前调用；1.1.0以一种BC-breaking的方式改变了这种行为。
             如果您在优化器更新（调用optimizer.step()）之前使用学习率调度程序（调用scheduler.step()），这将跳过学习率调度程序的第一个值。
-            如果您在升级到PyTorch 1.1.0之后无法复制结果，请检查是否在错误的时间调用了scheduler.step()。
+            如果您在升级到PyTorch 1.1.0之后无法复现原有结果，请检查是否在错误的时间调用了scheduler.step()。
         """
-        #   为了 BC-breaking 而新增了一个 tensor 类型判断
+        #   为了 BC-breaking 新增一个 tensor 类型判断
         def compute_should_use_set_data(tensor, tensor_applied):
-            if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
+            if torch._has_compatible_shallow_copy_type(tensor, tensor_applied): # 新张量兼容现有张量执行该逻辑
+                """
+                    如果新的张量兼容现有的张量，可使用".data="就地更改张量，并且在未来的行为中也是重写这个已经存在的张量。
+                    然而，如果执行BC-breaking改变当前的行为，并且希望这种改变可以在未来的版本中实现，
+                    所以引入`torch.__future__.get_overwrite_module_params_on_conversion()`这个全局标记，
+                    让用户控制在未来版本中重写新张量。
+                    
+                    BC-breaking并不是在这个方法中实现，这里只是一个BC-breaking方法执行后的张量判断
+                """
                 # If the new tensor has compatible tensor type as the existing tensor,
                 # 如果新的张量有兼容的张量类型作为现有的张量
                 # the current behavior is to change the tensor in-place using `.data =`,
@@ -732,8 +747,17 @@ class Module:
                 # global flag to let the user control whether they want the future
                 # behavior of overwriting the existing tensor or not.
                 # 全局标志，让用户控制他们未来是否想要重写现有张量的。
+                """
+                torch.__future__方法说明：
+                当使用下面的方法转换一个nn.Module的时候：
+                    1. `module.cuda()` / `.cpu()` (for moving `module` between devices)
+                    2. `module.float()` / `.double()` / `.half()` (for converting `module` to a different dtype)
+                    3. `module.to()` / `.type()` (for changing `module`'s device or dtype)
+                    4. `module._apply(fn)` (for generic functions applied to `module`)
+                这个全局标记控制是否为参数分配新的张量，而不是就地更改这个存在的参数，默认为False
+                """
                 return not torch.__future__.get_overwrite_module_params_on_conversion()
-            else:
+            else:   # 新张量不兼容现有张量执行该逻辑
                 return False
 
         # 处理参数及其gradint
@@ -743,33 +767,37 @@ class Module:
             # Tensors stored in modules are graph leaves, and we don't want to
             # track autograd history of `param_applied`, so we have to use
             # `with torch.no_grad():`
-            #
             with torch.no_grad():
+                # 对参数调用fn进行处理，得到param_applied
                 param_applied = fn(param)
+            # 用compute_should_use_set_data判断一下，是否需要替换原先的参数
             should_use_set_data = compute_should_use_set_data(param, param_applied)
             if should_use_set_data:
-                param.data = param_applied
+                param.data = param_applied  # 就地更改param.data
                 out_param = param
             else:
                 assert isinstance(param, Parameter)
                 assert param.is_leaf
+                # 用param_applied重新设置
                 out_param = Parameter(param_applied, param.requires_grad)
                 self._parameters[key] = out_param
 
-            if param.grad is not None:
+            if param.grad is not None:  # 如果参数有梯度
                 with torch.no_grad():
-                    grad_applied = fn(param.grad)
+                    grad_applied = fn(param.grad)   # 对参数的grad调用fn进行处理
+                # 用compute_should_use_set_data判断一下，是否需要替换原先的param.grad
                 should_use_set_data = compute_should_use_set_data(param.grad, grad_applied)
                 if should_use_set_data:
-                    out_param.grad.data = grad_applied
+                    out_param.grad.data = grad_applied  # 就地更改out_param.grad.data
                 else:
                     assert param.grad.is_leaf
+                    # 用param.grad.requires_grad重新设置
                     out_param.grad = grad_applied.requires_grad_(param.grad.requires_grad)
 
-        # 处理 buffers
+        # 遍历 buffers
         for key, buf in self._buffers.items():
             if buf is not None:
-                self._buffers[key] = fn(buf)
+                self._buffers[key] = fn(buf)    # 对buf调用fn进行处理
 
         return self
 
@@ -818,7 +846,7 @@ class Module:
         """
         for module in self.children():
             module.apply(fn) # 对该模块的子模块调用fn方法
-        fn(self) # 对当前模型调用fn方法
+        fn(self) # 对当前主模型调用fn方法
         return self
 
     """
@@ -848,7 +876,7 @@ class Module:
         This also makes associated parameters and buffers different objects. So
         it should be called before constructing optimizer if the module will
         live on GPU while being optimized.
-        这也使得相关的参数和缓冲区成为不同的对象。因此，如果模块将在GPU上运行而被优化，则应该在构建优化器之前调用它。
+        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在GPU上时被优化，那么它应该在构建优化器之前被调用
 
         .. note::
             This method modifies the module in-place.
@@ -870,6 +898,7 @@ class Module:
         This also makes associated parameters and buffers different objects. So
         it should be called before constructing optimizer if the module will
         live on IPU while being optimized.
+        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在IPU上时被优化，那么它应该在构建优化器之前被调用
 
         .. note::
             This method modifies the module in-place.
@@ -889,6 +918,7 @@ class Module:
         This also makes associated parameters and buffers different objects. So
         it should be called before constructing optimizer if the module will
         live on XPU while being optimized.
+        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在XPU上时被优化，那么它应该在构建优化器之前被调用
 
         .. note::
             This method modifies the module in-place.
@@ -1539,14 +1569,16 @@ class Module:
 
     def __getattr__(self, name: str) -> Union[Tensor, 'Module']:
         """
-        为了确保 getattr 能访问到所有的属性，nn.Module 也重载了 __getattr__ 函数，
-        以访问 self._parameters，self._buffers，self._modules 中的属性。
-        根据 Python 对实例属性的查找规则，当我们调用 module.attribute 的时候，
-        Python 会首先查找 module 的 类及其基类的 __dict__，然后查找这个 object 的 __dict__，最后查找 __getattr__ 函数。
-        因此，虽然 nn.Module 的 __getattr__ 只查找了 self._parameters，self._buffers，self._modules 三个成员变量，
-        但是 getattr(module, 'attribute') 覆盖的范围和 __dir__ 暴露的范围是一致的。
+        __getatrr__()方法直接获取self._parameters，self._buffers，self._modules三个成员变量中某个具体参数的值。
+        假定，_parameters={"w1":1, "w2":2, "w3":3},当调用module.w1时值为1，
+            而module.__dict__只是返回包含'_parameters': OrderedDict()键值对的字典，
+            如果要获取和module.w1一样的结果，则为module.__dict__["_parameters"]["w1"]
+
+        为了确保 getattr 能访问到所有的属性，nn.Module 也重写了 __getattr__ 函数，以访问 self._parameters，self._buffers，self._modules 中的属性。
+        根据 Python 对实例属性的查找规则，当我们调用 module.attribute 的时候，Python 会首先查找 module 的 类及其基类的 __dict__，然后查找这个 object 的 __dict__，最后查找 __getattr__ 函数。
+        因此，虽然 nn.Module 的 __getattr__ 只查找了 self._parameters，self._buffers，self._modules 三个成员变量，但是 getattr(module, 'attribute') 覆盖的范围和 __dir__ 暴露的范围是一致的。
         """
-        if '_parameters' in self.__dict__:  # 判断_parameters是否在模块的属性字典中
+        if '_parameters' in self.__dict__:  # 判断_parameters是否在实例属性字典中
             _parameters = self.__dict__['_parameters']  # 获取属性'_parameters'的OrderedDict字典对象
             if name in _parameters:  # 判断name是否在OrderedDict字典对象中
                 return _parameters[name]
@@ -2063,13 +2095,15 @@ class Module:
         modules = self.named_modules(prefix=prefix) if recurse else [(prefix, self)]
         for module_prefix, module in modules:
             # 使用lambda方法获取模块某个属性的名称和值的字典，并赋值给members
+            # get_members_fn(module) = lambda module: module._parameters.items()
+            # 或get_members_fn(module) = lambda module: module._buffers.items()
             members = get_members_fn(module)
             for k, v in members:
                 if v is None or v in memo:
                     continue
                 memo.add(v)
                 name = module_prefix + ('.' if module_prefix else '') + k
-                yield name, v # 返回属性的名称和值
+                yield name, v # 返回属性的名称和值的生成器
     """
     常见的属性访问方法
 
@@ -2197,7 +2231,7 @@ class Module:
 
     def children(self) -> Iterator['Module']:
         r"""Returns an iterator over immediate children modules.
-        返回直接子模块上的迭代器。
+        返回所有子模块的迭代器。
 
         Yields:
             Module: a child module
@@ -2206,10 +2240,13 @@ class Module:
             yield module
 
     def named_children(self) -> Iterator[Tuple[str, 'Module']]:
+        """
+            def named_children(self)
+
+        """
         r"""Returns an iterator over immediate children modules, yielding both
         the name of the module as well as the module itself.
-        直接返回包含子模块的迭代器，生成模块名和模块本身。
-
+        返回所有子模块名称和模块本身的元组迭代器
 
         Yields:
             (string, Module): Tuple containing a name and child module
@@ -2226,12 +2263,13 @@ class Module:
         for name, module in self._modules.items():
             if module is not None and module not in memo:
                 memo.add(module)
+                # 这里其实也可以写做"yield module"相当于def children(self)方法
+                # 构建def children(self)方法只是为了用于不同的调用场景
                 yield name, module
 
     def modules(self) -> Iterator['Module']:
         r"""Returns an iterator over all modules in the network.
-        返回包含网络中所有模块的一个迭代器。
-        **迭代器的意思就是可以被for循环访问！**而经过for循环后得到的就是一个又一个的tuple！
+        返回网络中所有模块（包含主模块和子模块）的迭代器。
 
         Yields:
             Module: a module in the network
@@ -2261,7 +2299,7 @@ class Module:
     def named_modules(self, memo: Optional[Set['Module']] = None, prefix: str = '', remove_duplicate: bool = True):
         r"""Returns an iterator over all modules in the network, yielding
         both the name of the module as well as the module itself.
-        返回所有模块的迭代器，生成模块名和模块本身。
+        返回网络中所有模块（包含主模块和子模块）的迭代器，包含模块名和模块本身。
 
         Args:
             memo: a memo to store the set of modules already added to the result
@@ -2300,15 +2338,39 @@ class Module:
         if self not in memo:
             if remove_duplicate:
                 memo.add(self)
-            yield prefix, self # 返回当前模块信息
+            # 生成主模块"前缀和模块本身"
+            yield prefix, self
+
+            # 这里和named_children()方法相似，只是后面需要分开调用子module和子module名称，所以这里没有使用生成器返回子module和子module名称
             for name, module in self._modules.items():
                 if module is None:
                     continue
+                # 这里生成子模块的前缀：prefix.name(主模块prefix不为空)或name(主模块prefix为空)
                 submodule_prefix = prefix + ('.' if prefix else '') + name
+
                 # 这里使用的module.named_modules不是self.named_modules(module是self的子模块)
-                # 子模块重复“yield prefix, self”之前的操作，返回所有子模块信息
+                # 子模块重复“yield prefix, self”之前的操作，返回层层嵌套所有子模块信息
                 for m in module.named_modules(memo, submodule_prefix, remove_duplicate):
-                    yield m # 返回子模块信息
+                    """
+                    if memo is None:# 判断memo是否为空，这里一般不为空
+                        memo = set()
+                    if self not in memo:# 判断子模块是否在memo中（多为不在）
+                        if remove_duplicate:
+                            memo.add(self)# 将子模块添加到memo集合中
+                        # 生成当前子模块"前缀和模块本身"（相当于后面子模块的主模块）
+                        yield prefix, self
+            
+                        # 这里和named_children()方法相似，只是后面需要分开调用子module和子module名称，所以这里没有使用生成器返回子module和子module名称
+                        for name, module in self._modules.items():
+                            if module is None:
+                                continue
+                            # 这里生成子模块的前缀：prefix.name(主模块prefix不为空)或prefix''name(主模块prefix为空)
+                            submodule_prefix = prefix + ('.' if prefix else '') + name
+                    """
+                    yield m # 生成子模块信息
+
+
+
     """
         训练与测试
 
@@ -2402,12 +2464,12 @@ class Module:
     def zero_grad(self, set_to_none: bool = False) -> None:
         r"""Sets gradients of all model parameters to zero. See similar function
         under :class:`torch.optim.Optimizer` for more context.
-        设置所有模型参数的梯度为零。更多内容请查看torch. optim. optimizer下的类似函数。
+        设置所有模型参数的梯度为零。更多内容请查看torch.optim.optimizer下的类似函数。
 
         Args:
             set_to_none (bool): instead of setting to zero, set the grads to None.
                 See :meth:`torch.optim.Optimizer.zero_grad` for details.
-            set_to_none (bool) -不设置为零，而是将梯度值设置为None。详见torch. optimizer . optimizer .zero_grad()。
+            set_to_none (bool) -将梯度值设置为None，而不是设置为零。详见torch. optimizer . optimizer .zero_grad()。
         """
         if getattr(self, '_is_replica', False):
             warnings.warn(
@@ -2437,7 +2499,7 @@ class Module:
             >>> class Model(nn.Module):
                 >>> def __init__(self):
                     >>> super().__init__()
-            # __class__是类的一个内置属性，表示类的类型，返回<type ‘type’>，也是类的实例属性，表示实例对象的所属的父类
+            # __class__是类的一个内置属性，实例调用__class__属性时会指向该实例对应的类，然后可以再去调用其它类属性
             >>> Model.__class__ # 结果：type，（表示类的类型，返回<type ‘type’> ）
             >>> Model().__class__ # 结果：__main__.Model，类的实例属性，表示实例对象的所属的父类
             >>> Model().__class__.__name__ # 结果：'Model'
@@ -2480,11 +2542,11 @@ class Module:
 
     def __dir__(self):
         """
-            重载的 __dir__ 函数会将 self._modules、self._parameters 和 self._buffers 中的 attributes 给暴露出来。
+            重构__dir__ 函数将 self._modules、self._parameters 和 self._buffers 中的 attributes 给暴露出来。
         """
-        module_attrs = dir(self.__class__)
-        attrs = list(self.__dict__.keys())
-        parameters = list(self._parameters.keys())
+        module_attrs = dir(self.__class__)  # 获取当前类(和继承类)属性和方法（不包含类实例属性【成员变量属性】）
+        attrs = list(self.__dict__.keys())  # 获取当前类实例属性【成员变量属性】
+        parameters = list(self._parameters.keys())  # 获取__getattr__()方法重载的实例属性
         modules = list(self._modules.keys())
         buffers = list(self._buffers.keys())
         keys = module_attrs + attrs + parameters + modules + buffers
