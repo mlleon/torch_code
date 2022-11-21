@@ -263,6 +263,9 @@ class Module:
     training: bool
     _is_full_backward_hook: Optional[bool]
 
+
+# 1.1 常用接口
+# 1.1.1 __init__ 函数
     """
     继承 nn.Module 的神经网络模块在实现自己的 __init__ 函数时，一定要先调用 super().__init__()。
     只有这样才能正确地初始化自定义的神经网络模块，否则会缺少上面代码中的成员变量而导致模块被调用时出错。
@@ -283,7 +286,7 @@ class Module:
         self.training = True    # 控制 training/testing 状态
         self._parameters: Dict[str, Optional[Parameter]] = OrderedDict()    # 在训练过程中会随着 BP 而更新的参数
         self._buffers: Dict[str, Optional[Tensor]] = OrderedDict()  # 在训练过程中不会随着 BP 而更新的参数
-        self._non_persistent_buffers_set: Set[str] = set()
+        self._non_persistent_buffers_set: Set[str] = set()  # 其他临时参数，不需要持久保存的buffer
         self._backward_hooks: Dict[int, Callable] = OrderedDict()   # Backward 完成后会被调用的 hook
         self._is_full_backward_hook = None
         self._forward_hooks: Dict[int, Callable] = OrderedDict()    # Forward 完成后会被调用的 hook
@@ -295,6 +298,589 @@ class Module:
 
     forward: Callable[..., Any] = _forward_unimplemented
 
+# 1.1.2 状态的转换
+    """
+        1、训练与测试
+
+        nn.Module 通过 self.training 来区分训练和测试两种状态，使得模块可以在训练和测试时有不同的 forward 行为（如 Batch Normalization）。
+        nn.Module 通过 self.train() 和 self.eval() 来修改训练和测试状态，其中 self.eval 直接调用了 self.train(False)，
+        而 self.train() 会修改 self.training 并通过 self.children() 来调整所有子模块的状态。
+
+    """
+
+    def train(self: T, mode: bool = True) -> T:
+        r"""Sets the module in training mode.
+            将模块设置为训练模式。
+
+        This has any effect only on certain modules. See documentations of
+        particular modules for details of their behaviors in training/evaluation
+        mode, if they are affected, e.g. :class:`Dropout`, :class:`BatchNorm`,
+        etc.
+        这只对某些模块有效。如果他们在训练/评估模式中受到影响，
+        请参阅特定模块的文档以了解他们的行为细节，如Dropout, BatchNorm等。
+
+        Args:
+            mode (bool): whether to set training mode (``True``) or evaluation
+                         mode (``False``). Default: ``True``.
+                         是否设置训练模式(True)或评估模式(False)。默认值:真的。
+
+        Returns:
+            Module: self
+        """
+        if not isinstance(mode, bool):
+            raise ValueError("training mode is expected to be boolean")
+        self.training = mode
+        for module in self.children():  # 保证子模块的模式和父模块模式一致
+            module.train(mode)
+        return self
+
+    def eval(self: T) -> T:
+        r"""Sets the module in evaluation mode.
+        将模块设置为评估模式。
+
+        This has any effect only on certain modules. See documentations of
+        particular modules for details of their behaviors in training/evaluation
+        mode, if they are affected, e.g. :class:`Dropout`, :class:`BatchNorm`,
+        etc.
+        这只对某些模块有效。如果他们在训练/评估模式中受到影响，
+        请参阅特定模块的文档以了解他们的行为细节，如Dropout, BatchNorm等。
+
+        This is equivalent with :meth:`self.train(False) <torch.nn.Module.train>`.
+        同时这和 self.train(False) 是同等的！
+
+        See :ref:`locally-disable-grad-doc` for a comparison between
+        `.eval()` and several similar mechanisms that may be confused with it.
+
+        Returns:
+            Module: self
+        """
+        return self.train(False)
+
+
+    """
+        2、梯度的处理
+
+        对于梯度的处理 nn.Module 有两个相关的函数实现，分别是 requires_grad_ 和 zero_grad 函数，
+        他们都调用了 self.parameters() 来访问所有的参数，并修改参数的 requires_grad 状态 或者 清理参数的梯度。
+    """
+
+    def requires_grad_(self: T, requires_grad: bool = True) -> T:
+        r"""Change if autograd should record operations on parameters in this
+        module.
+            是否更改记录该模块中的参数的autograd操作
+
+        This method sets the parameters' :attr:`requires_grad` attributes
+        in-place.
+        该方法就地设置参数的requires_grad属性。
+
+        This method is helpful for freezing part of the module for finetuning
+        or training parts of a model individually (e.g., GAN training).
+        这种方法有助于冻结模块的一部分，以便对模型的各个部分进行微调或单独训练(如GAN训练)。
+
+        See :ref:`locally-disable-grad-doc` for a comparison between
+        `.requires_grad_()` and several similar mechanisms that may be confused with it.
+        参阅Locally disabling gradient computation 来比较**.requires_grad_()**和几个可能与之混淆的类似机制。
+
+        Args:
+            requires_grad (bool): whether autograd should record operations on
+                                  parameters in this module. Default: ``True``.
+            是否记录该模块中的参数的autograd操作。默认值:True
+        Returns:
+            Module: self
+        """
+        for p in self.parameters():
+            p.requires_grad_(requires_grad)
+        return self
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        r"""Sets gradients of all model parameters to zero. See similar function
+        under :class:`torch.optim.Optimizer` for more context.
+        设置模型所有参数的梯度为零。更多内容请查看torch.optim.optimizer下的类似函数。
+
+        Args:
+            set_to_none (bool): instead of setting to zero, set the grads to None.
+                See :meth:`torch.optim.Optimizer.zero_grad` for details.
+            将梯度值设置为None，而不是设置为零。详见方法torch.optimizer.Optimizer.zero_grad()。
+        """
+        if getattr(self, '_is_replica', False):
+            warnings.warn(
+                "Calling .zero_grad() from a module created with nn.DataParallel() has no effect. "
+                "The parameters are copied (in a differentiable manner) from the original module. "
+                "This means they are not leaf nodes in autograd and so don't accumulate gradients. "
+                "If you need gradients in your forward method, consider using autograd.grad instead.")
+
+        for p in self.parameters():
+            if p.grad is not None:
+                if set_to_none:
+                    p.grad = None   # 将梯度值设置为None
+                else:
+                    if p.grad.grad_fn is not None:
+                        p.grad.detach_()
+                    else:
+                        p.grad.requires_grad_(False)
+                    p.grad.zero_()
+
+# 1.1.3 _apply()和apply()方法
+
+    def _apply(self, fn):
+        """
+            def cpu()和def GPU()都是通过 self._apply(function) 配合def to()方法来实现的，
+            function 一般是 lambda 表达式或其他自定义函数。因此，用户其实也可以通过 self._apply(function) 来实现一些特殊的转换。
+            self._apply() 函数实际上做了如下 3 件事情，最终将 function 完整地应用于整个模块。
+                1、通过 self.children() 进行递归的调用
+                2、对 self._parameters 中的参数及其 gradient 通过 function 进行处理
+                3、对 self._buffers 中的 buffer 逐个通过 function 来进行处理
+
+            apply 函数和 _apply 函数的区别在于，_apply() 是专门针对 parameter 和 buffer 而实现的一个“仅供内部使用”的接口，
+            但是 apply 函数是“公有”接口 。apply 实际上可以通过修改 fn 来实现 _apply 能实现的功能，同时还可以实现其他功能。
+            self._apply(lambda t: t.cuda(device))
+        """
+        """
+        其实遍历parameter，用apply也是可以实现的，不过这里还是重新写了一个_apply。
+        _apply对参数和参数的梯度都用fn处理了一遍。
+        处理完还需要用compute_should_use_set_data判断一下，是否需要替换原先的参数。
+        """
+        # 对所有子module递归调用_apply()方法
+        for module in self.children():
+            # 对子模块递归调用fn方法,如lambda t: t.cuda(device)方法将模型转移到GPU
+            module._apply(fn)
+        """
+            在PyTorch 1.1.0之前，学习率调度程序应该在优化器更新之前调用；1.1.0以一种BC-breaking的方式改变了这种行为。
+            如果您在优化器更新（调用optimizer.step()）之前使用学习率调度程序（调用scheduler.step()），这将跳过学习率调度程序的第一个值。
+            如果您在升级到PyTorch 1.1.0之后无法复现原有结果，请检查是否在错误的时间调用了scheduler.step()。
+        """
+
+        #   为了 BC-breaking 新增一个 tensor 类型判断
+        def compute_should_use_set_data(tensor, tensor_applied):
+            if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
+                # tensor_applied兼容现有张量执行该逻辑, return True
+                """
+                    如果新的张量兼容现有的张量，可使用".data="就地更改张量，并且在未来的行为中也是重写这个已经存在的张量。
+                    然而，如果执行BC-breaking改变当前的行为，并且希望这种改变可以在未来的版本中实现，
+                    所以引入`torch.__future__.get_overwrite_module_params_on_conversion()`这个全局标记，
+                    让用户控制在未来版本中重写新张量。
+
+                    BC-breaking并不是在这个方法中实现，这里只是一个BC-breaking方法执行后的张量判断
+                """
+                # If the new tensor has compatible tensor type as the existing tensor,
+                # 如果新的张量有兼容的张量类型作为现有的张量
+                # the current behavior is to change the tensor in-place using `.data =`,
+                # 当前的行为是使用".data="就地更改张量
+                # and the future behavior is to overwrite the existing tensor. However,
+                # 并且未来的行为是重写这个已经存在的张量
+                # changing the current behavior is a BC-breaking change, and we want it
+                # 然而，改变当前的行为是一个BC-breaking改变
+                # to happen in future releases. So for now we introduce the
+                # 我们希望它在未来的版本中出现
+                # `torch.__future__.get_overwrite_module_params_on_conversion()`
+                # 所以现在我们引入`torch.__future__.get_overwrite_module_params_on_conversion()`
+                # global flag to let the user control whether they want the future
+                # behavior of overwriting the existing tensor or not.
+                # 全局标志，让用户控制他们未来是否想要重写现有张量的。
+                """
+                torch.__future__方法说明：
+                当使用下面的方法转换一个nn.Module的时候：
+                    1. `module.cuda()` / `.cpu()` (for moving `module` between devices)
+                    2. `module.float()` / `.double()` / `.half()` (for converting `module` to a different dtype)
+                    3. `module.to()` / `.type()` (for changing `module`'s device or dtype)
+                    4. `module._apply(fn)` (for generic functions applied to `module`)
+                这个全局标记控制是否为参数分配新的张量，而不是就地更改这个存在的参数，默认为False
+                """
+                return not torch.__future__.get_overwrite_module_params_on_conversion()
+            else:  # tensor_applied不兼容现有张量执行该逻辑 return False
+                return False
+
+        # 处理参数及其gradint
+        for key, param in self._parameters.items():
+            if param is None:
+                continue
+            # Tensors stored in modules are graph leaves, and we don't want to
+            # track autograd history of `param_applied`, so we have to use
+            # `with torch.no_grad():`
+            with torch.no_grad():
+                # 对参数调用fn进行处理，得到param_applied
+                param_applied = fn(param)
+            # 用compute_should_use_set_data判断一下，是否需要替换原先的参数
+            should_use_set_data = compute_should_use_set_data(param, param_applied)
+            if should_use_set_data:
+                param.data = param_applied  # 就地更改param.data
+                out_param = param
+            else:
+                assert isinstance(param, Parameter)
+                assert param.is_leaf
+                # 用param_applied重新设置
+                out_param = Parameter(param_applied, param.requires_grad)
+                self._parameters[key] = out_param
+
+            if param.grad is not None:  # 如果参数有梯度
+                with torch.no_grad():
+                    grad_applied = fn(param.grad)  # 对参数的grad调用fn进行处理
+                # 用compute_should_use_set_data判断一下，是否需要替换原先的param.grad
+                should_use_set_data = compute_should_use_set_data(param.grad, grad_applied)
+                if should_use_set_data:
+                    out_param.grad.data = grad_applied  # 就地更改out_param.grad.data
+                else:
+                    assert param.grad.is_leaf
+                    # 用param.grad.requires_grad重新设置
+                    out_param.grad = grad_applied.requires_grad_(param.grad.requires_grad)
+
+        # 遍历 buffers
+        for key, buf in self._buffers.items():
+            if buf is not None:
+                self._buffers[key] = fn(buf)  # 对buf调用fn进行处理
+
+        return self
+
+        """
+            apply 函数 与 _apply() 函数不同的是，apply 函数只是简单地递归调用了 self.children() 去处理自己以及子模块.
+        """
+
+    def apply(self: T, fn: Callable[['Module'], None]) -> T:
+        r"""Applies ``fn`` recursively to every submodule (as returned by ``.children()``)
+        as well as self. Typical use includes initializing the parameters of a model
+        (see also :ref:`nn-init-doc`).
+        递归地将fn函数应用于每个子模块(由.children()返回) 和 self。典型的用法包括初始化模型的参数(参见torch.nn.init)。
+
+        Args:
+            fn (:class:`Module` -> None): function to be applied to each submodule
+            用于每个子模块的函数，中间的参数必然是子模块！如果用于参数的初始化，那么就递归该模块下的各个函数
+
+        Returns:
+            Module: self
+
+        Example::
+            经常用于初始化init_weights的操作
+            >>> @torch.no_grad()
+            >>> def init_weights(m):
+            >>>     print(m)
+            >>>     if type(m) == nn.Linear:
+            >>>         m.weight.fill_(1.0)
+            >>>         print(m.weight)
+            >>> net = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+            >>> net.apply(init_weights)
+            Linear(in_features=2, out_features=2, bias=True)
+            Parameter containing:
+            tensor([[ 1.,  1.],
+                    [ 1.,  1.]])
+            Linear(in_features=2, out_features=2, bias=True)
+            Parameter containing:
+            tensor([[ 1.,  1.],
+                    [ 1.,  1.]])
+            Sequential(
+              (0): Linear(in_features=2, out_features=2, bias=True)
+              (1): Linear(in_features=2, out_features=2, bias=True)
+            )
+            Sequential(
+              (0): Linear(in_features=2, out_features=2, bias=True)
+              (1): Linear(in_features=2, out_features=2, bias=True)
+            )
+        """
+        for module in self.children():
+            module.apply(fn)  # 对该模块的子模块调用fn方法
+        fn(self)  # 对当前主模型调用fn方法
+        return self
+
+# 1.1.4 参数的转换或转移
+    """
+        nn.Module 实现了如下 8 个常用函数将模块转变成 float16 等类型、转移到 CPU/ GPU上。
+            1、CPU：将所有 parameters 和 buffer 转移到 CPU 上
+            2、type：将所有 parameters 和 buffer 转变成另一个类型
+            3、CUDA：将所有 parameters 和 buffer 转移到 GPU 上
+            4、float：将所有浮点类型的 parameters 和 buffer 转变成 float32 类型
+            5、double：将所有浮点类型的 parameters 和 buffer 转变成 double 类型
+            6、half：将所有浮点类型的 parameters 和 buffer 转变成 float16 类型
+            7、bfloat16：将所有浮点类型的 parameters 和 buffer 转变成 bfloat16 类型
+            8、to：移动模块或/和改变模块的类型
+
+        这些函数的功能最终都是通过 self._apply(function) 来实现的， function 一般是 lambda 表达式或其他自定义函数。
+        因此，用户其实也可以通过 self._apply(function) 来实现一些特殊的转换。self._apply() 函数实际上做了如下 3 件事情，最终将 function 完整地应用于整个模块。
+            1、通过 self.children() 进行递归的调用
+            2、对 self._parameters 中的参数及其 gradient 通过 function 进行处理
+            3、对 self._buffers 中的 buffer 逐个通过 function 来进行处理
+
+    """
+
+    def cuda(self: T, device: Optional[Union[int, device]] = None) -> T:
+        r"""Moves all model parameters and buffers to the GPU.
+        将所有模型参数和缓冲区移动到GPU。
+
+        This also makes associated parameters and buffers different objects. So
+        it should be called before constructing optimizer if the module will
+        live on GPU while being optimized.
+        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在GPU上时被优化，那么它应该在构建优化器之前被调用
+
+        .. note::
+            This method modifies the module in-place.
+            同样的，此方法将就地修改模块。
+
+        Args:
+            device (int, optional): if specified, all parameters will be
+                copied to that device
+            如果指定了，所有参数将被复制到该设备
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.cuda(device))
+
+    def ipu(self: T, device: Optional[Union[int, device]] = None) -> T:
+        r"""Moves all model parameters and buffers to the IPU.
+
+        This also makes associated parameters and buffers different objects. So
+        it should be called before constructing optimizer if the module will
+        live on IPU while being optimized.
+        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在IPU上时被优化，那么它应该在构建优化器之前被调用
+
+        .. note::
+            This method modifies the module in-place.
+
+        Arguments:
+            device (int, optional): if specified, all parameters will be
+                copied to that device
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.ipu(device))
+
+    def xpu(self: T, device: Optional[Union[int, device]] = None) -> T:
+        r"""Moves all model parameters and buffers to the XPU.
+
+        This also makes associated parameters and buffers different objects. So
+        it should be called before constructing optimizer if the module will
+        live on XPU while being optimized.
+        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在XPU上时被优化，那么它应该在构建优化器之前被调用
+
+        .. note::
+            This method modifies the module in-place.
+
+        Arguments:
+            device (int, optional): if specified, all parameters will be
+                copied to that device
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.xpu(device))
+
+    def cpu(self: T) -> T:
+        r"""Moves all model parameters and buffers to the CPU.
+        将所有模型参数和缓冲区移动到CPU。
+
+        .. note::
+            This method modifies the module in-place.
+            此方法将就地修改模块（应该当前代码之前的所有立刻移动到别处）。
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.cpu())
+
+    def type(self: T, dst_type: Union[dtype, str]) -> T:
+        r"""Casts all parameters and buffers to :attr:`dst_type`.
+
+        .. note::
+            This method modifies the module in-place.
+
+        Args:
+            dst_type (type or string): the desired type
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.type(dst_type))
+
+    def float(self: T) -> T:
+        r"""Casts all floating point parameters and buffers to ``float`` datatype.
+        将所有浮点参数和缓冲区强制转换为浮点数据类型。
+
+        .. note::
+            This method modifies the module in-place.
+            此方法将就地修改模块。
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.float() if t.is_floating_point() else t)
+
+    def double(self: T) -> T:
+        r"""Casts all floating point parameters and buffers to ``double`` datatype.
+
+        .. note::
+            This method modifies the module in-place.
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.double() if t.is_floating_point() else t)
+
+    def half(self: T) -> T:
+        r"""Casts all floating point parameters and buffers to ``half`` datatype.
+
+        .. note::
+            This method modifies the module in-place.
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.half() if t.is_floating_point() else t)
+
+    def bfloat16(self: T) -> T:
+        r"""Casts all floating point parameters and buffers to ``bfloat16`` datatype.
+
+        .. note::
+            This method modifies the module in-place.
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: t.bfloat16() if t.is_floating_point() else t)
+
+    def to_empty(self: T, *, device: Union[str, device]) -> T:
+        r"""Moves the parameters and buffers to the specified device without copying storage.
+
+        Args:
+            device (:class:`torch.device`): The desired device of the parameters
+                and buffers in this module.
+
+        Returns:
+            Module: self
+        """
+        return self._apply(lambda t: torch.empty_like(t, device=device))
+
+    @overload
+    def to(self: T, device: Optional[Union[int, device]] = ..., dtype: Optional[Union[dtype, str]] = ...,
+           non_blocking: bool = ...) -> T:
+        ...
+
+    @overload
+    def to(self: T, dtype: Union[dtype, str], non_blocking: bool = ...) -> T:
+        ...
+
+    @overload
+    def to(self: T, tensor: Tensor, non_blocking: bool = ...) -> T:
+        ...
+
+    def to(self, *args, **kwargs):
+        r"""Moves and/or casts the parameters and buffers.
+            移动或强制转换参数和缓冲区。
+
+        This can be called as
+
+        .. function:: to(device=None, dtype=None, non_blocking=False)
+           :noindex:
+
+        .. function:: to(dtype, non_blocking=False)
+           :noindex:
+
+        .. function:: to(tensor, non_blocking=False)
+           :noindex:
+
+        .. function:: to(memory_format=torch.channels_last)
+           :noindex:
+
+        Its signature is similar to :meth:`torch.Tensor.to`, but only accepts
+        floating point or complex :attr:`dtype`\ s. In addition, this method will
+        only cast the floating point or complex parameters and buffers to :attr:`dtype`
+        (if given).
+        它的签名类似于方法：torch.Tensor.to()，但只接受浮点数或复杂的dtype。
+        此外，该方法只将浮点数或复杂参数和缓冲区强制转换为:attr: ’ dtype(如果给定)。
+        The integral parameters and buffers will be moved
+        :attr:`device`, if that is given, but with dtypes unchanged. When
+        :attr:`non_blocking` is set, it tries to convert/move asynchronously
+        with respect to the host if possible, e.g., moving CPU Tensors with
+        pinned memory to CUDA devices.
+        如果给定，整型参数和缓冲区将被移到device，但dtype不变。当设置non_blocking时，
+        如果可能的话，它会尝试相对于主机进行异步转换/移动，例如，将带有固定内存的CPU张量移动到CUDA设备。
+
+        See below for examples.
+
+        .. note::
+            This method modifies the module in-place.
+            此方法将就地修改模块。
+
+        Args:
+            device (:class:`torch.device`): the desired device of the parameters
+                and buffers in this module
+                在这个模块中参数和缓冲器的期望设备
+            dtype (:class:`torch.dtype`): the desired floating point or complex dtype of
+                the parameters and buffers in this module
+                这个模块中参数和缓冲区的浮点型或复杂的Dtype
+            tensor (torch.Tensor): Tensor whose dtype and device are the desired
+                dtype and device for all parameters and buffers in this module
+                张量的dtype和设备是这个模块中所有参数和缓冲区所需的dtype和设备
+            memory_format (:class:`torch.memory_format`): the desired memory
+                format for 4D parameters and buffers in this module (keyword
+                only argument)
+                该模块中4D参数和缓冲区所需的内存格式(仅关键字参数)
+
+        Returns:
+            Module: self
+
+        Examples::
+
+            >>> linear = nn.Linear(2, 2)
+            >>> linear.weight
+            Parameter containing:
+            tensor([[ 0.1913, -0.3420],
+                    [-0.5113, -0.2325]])
+            >>> linear.to(torch.double)
+            Linear(in_features=2, out_features=2, bias=True)
+            >>> linear.weight
+            Parameter containing:
+            tensor([[ 0.1913, -0.3420],
+                    [-0.5113, -0.2325]], dtype=torch.float64)
+            >>> gpu1 = torch.device("cuda:1")
+            >>> linear.to(gpu1, dtype=torch.half, non_blocking=True)
+            Linear(in_features=2, out_features=2, bias=True)
+            >>> linear.weight
+            Parameter containing:
+            tensor([[ 0.1914, -0.3420],
+                    [-0.5112, -0.2324]], dtype=torch.float16, device='cuda:1')
+            >>> cpu = torch.device("cpu")
+            >>> linear.to(cpu)
+            Linear(in_features=2, out_features=2, bias=True)
+            >>> linear.weight
+            Parameter containing:
+            tensor([[ 0.1914, -0.3420],
+                    [-0.5112, -0.2324]], dtype=torch.float16)
+
+            >>> linear = nn.Linear(2, 2, bias=None).to(torch.cdouble)
+            >>> linear.weight
+            Parameter containing:
+            tensor([[ 0.3741+0.j,  0.2382+0.j],
+                    [ 0.5593+0.j, -0.4443+0.j]], dtype=torch.complex128)
+            >>> linear(torch.ones(3, 2, dtype=torch.cdouble))
+            tensor([[0.6122+0.j, 0.1150+0.j],
+                    [0.6122+0.j, 0.1150+0.j],
+                    [0.6122+0.j, 0.1150+0.j]], dtype=torch.complex128)
+
+        """
+
+        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
+
+        if dtype is not None:
+            if not (dtype.is_floating_point or dtype.is_complex):
+                raise TypeError('nn.Module.to only accepts floating point or complex '
+                                'dtypes, but got desired dtype={}'.format(dtype))
+            if dtype.is_complex:
+                warnings.warn(
+                    "Complex modules are a new feature under active development whose design may change, "
+                    "and some modules might not work as expected when using complex tensors as parameters or buffers. "
+                    "Please file an issue at https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml "
+                    "if a complex module does not work as expected.")
+
+        def convert(t):
+            if convert_to_format is not None and t.dim() in (4, 5):
+                return t.to(device, dtype if t.is_floating_point() or t.is_complex() else None,
+                            non_blocking, memory_format=convert_to_format)
+            return t.to(device, dtype if t.is_floating_point() or t.is_complex() else None, non_blocking)
+
+        return self._apply(convert)
+
+# 1.2 属性的增删改查
+
+# 1.2.1 属性设置（属性增加和修改）
     """
         属性设置方法：
     
@@ -497,6 +1083,303 @@ class Module:
         r"""Alias for :func:`add_module`."""
         self.add_module(name, module)   # 感觉add_module()方法有点多余，可以和register_module()方法合并在一起
 
+
+# 1.2.2 属性访问
+    """
+    常见的属性访问方法
+
+    nn.Module 中的常用函数包括下面 8 个，他们都会返回一个迭代器用于访问模块中的 buffer，parameter，子模块等。他们的功能与区别如下
+        1、parameters：调用 self.named_parameters 并返回模型参数，被应用于 self.requires_grad_ 和 self.zero_grad 函数中
+        2、named_parameters：返回 self._parameters 中的 name 和 parameter 元组，如果 recurse=True 还会返回子模块中的模型参数
+        3、buffers：调用 self.named_buffers 并返回模型参数
+        4、named_buffers：返回 self._buffers 中的 name 和 buffer 元组，如果 recurse=True 还会返回子模块中的模型 buffer
+        5、children：调用 self.named_children，只返回 self._modules 中的模块，被应用于 self.train 函数中
+        6、named_children：只返回 self._modules 中的 name 和 module 元组
+        7、modules：调用 self.named_modules 并返回各个 module 但不返回 name
+        8、named_modules：返回 self._modules 下的 name 和 module 元组，并递归调用和返回 module.named_modules
+
+    named_parameters 和 named_buffers 都是调用的 self._named_members 实现的，
+    named_modules 和 named_children 虽然有自己的实现，但和 self._named_members 一样，
+    都是通过 set 类型的 memo 来记录已经抛出的模块，如果 member 不在 memo 中，
+    才会将 member 抛出并将 member 放入 memo 中，因此 named_parameters、named_buffers、
+    named_modules 和named_children 都不会返回重复的 parameter、 buffer 或 module。
+    
+    还有一种常见的属性访问是通过 module.attribute 来进行的。这种调用等价于 getattr(module, 'attribute')。
+        和 nn.Module 对 __delattr__ 以及 __setattr__ 的重载类似，为了确保 getattr 能访问到所有的属性，
+        nn.Module 也重载了 __getattr__ 函数，以访问 self._parameters，self._buffers，self._modules 中的属性。
+
+    根据 Python 对实例属性的查找规则，当我们调用 module.attribute 的时候，Python 会首先查找 module 的类及其基类的 __dict__，
+        然后查找这个 object 的 __dict__，最后查找 __getattr__ 函数。因此，虽然 nn.Module 的 __getattr__ 只查找了 
+        self._parameters，self._buffers，self._modules 三个成员变量，但是 getattr(module, 'attribute') 覆盖的范围和 __dir__ 暴露的范围是一致的。
+
+    """
+
+    def _named_members(self, get_members_fn, prefix='', recurse=True):
+        r"""Helper method for yielding various names + members of modules.
+        产生各种名称的成员模块的辅助方法，该方法的目的是为了确定是获取当前模块还是所有模块的属性的名称和值
+        """
+        memo = set()
+        # 三元表达式，如果为recurse=True，返回所有模块，如果为False仅返回主模块
+        modules = self.named_modules(prefix=prefix) if recurse else [(prefix, self)]
+        for module_prefix, module in modules:
+            # 使用lambda方法获取模块某个属性的名称和值的字典，并赋值给members
+            # get_members_fn(module) = lambda module: module._parameters.items()
+            # 或get_members_fn(module) = lambda module: module._buffers.items()
+            members = get_members_fn(module)
+            for k, v in members:
+                if v is None or v in memo:
+                    continue
+                memo.add(v)
+                name = module_prefix + ('.' if module_prefix else '') + k
+                yield name, v  # 返回属性的名称和值的生成器
+
+    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        r"""Returns an iterator over module parameters.
+            返回模块参数上的迭代器。
+
+        This is typically passed to an optimizer.
+        这通常被传递给优化器。
+
+        Args:
+            recurse (bool): if True, then yields parameters of this module
+                and all submodules. Otherwise, yields only parameters that
+                are direct members of this module.
+                如果为True，则生成该模块和所有子模块的参数。否则，只生成该模块的直接成员参数。
+
+        Yields:
+            Parameter: module parameter
+
+        Example::
+
+            >>> for param in model.parameters():
+            >>>     print(type(param), param.size())
+            <class 'torch.Tensor'> (20L,)
+            <class 'torch.Tensor'> (20L, 1L, 5L, 5L)
+
+        """
+        for name, param in self.named_parameters(recurse=recurse):
+            yield param
+
+    def named_parameters(self, prefix: str = '', recurse: bool = True) -> Iterator[Tuple[str, Parameter]]:
+        r"""Returns an iterator over module parameters, yielding both the
+        name of the parameter as well as the parameter itself.
+        返回模块参数迭代器，产生参数名称和参数值
+
+        Args:
+            prefix (str): prefix to prepend to all parameter names.
+            recurse (bool): if True, then yields parameters of this module
+                and all submodules. Otherwise, yields only parameters that
+                are direct members of this module.
+                如果为True，生成该模块和所有子模块的参数迭代器，如果为False，仅返回当前模块
+
+        Yields:
+            (string, Parameter): Tuple containing the name and parameter
+
+        Example::
+
+            >>> for name, param in self.named_parameters():
+            >>>    if name in ['bias']:
+            >>>        print(param.size())
+
+        """
+        gen = self._named_members(
+            lambda module: module._parameters.items(),
+            prefix=prefix, recurse=recurse)
+        for elem in gen:
+            yield elem
+
+    def buffers(self, recurse: bool = True) -> Iterator[Tensor]:
+        r"""Returns an iterator over module buffers.
+        返回一个模块缓冲区迭代器
+
+        Args:
+            recurse (bool): if True, then yields buffers of this module
+                and all submodules. Otherwise, yields only buffers that
+                are direct members of this module.
+            如果为True，生成该模块和所有子模块的buffers迭代器，如果为False，仅返回当前模块
+        Yields:
+            torch.Tensor: module buffer
+
+        Example::
+
+            >>> for buf in model.buffers():
+            >>>     print(type(buf), buf.size())
+            <class 'torch.Tensor'> (20L,)
+            <class 'torch.Tensor'> (20L, 1L, 5L, 5L)
+
+        """
+        for _, buf in self.named_buffers(recurse=recurse):
+            yield buf
+
+    def named_buffers(self, prefix: str = '', recurse: bool = True) -> Iterator[Tuple[str, Tensor]]:
+        r"""Returns an iterator over module buffers, yielding both the
+        name of the buffer as well as the buffer itself.
+        返回模块缓冲区迭代器，生成缓冲区名称和缓冲区值
+        Args:
+            prefix (str): prefix to prepend to all buffer names.
+            recurse (bool): if True, then yields buffers of this module
+                and all submodules. Otherwise, yields only buffers that
+                are direct members of this module.
+            如果为True，生成该模块和所有子模块的buffers迭代器，如果为False，仅返回当前模块
+
+        Yields:
+            (string, torch.Tensor): Tuple containing the name and buffer
+
+        Example::
+
+            >>> for name, buf in self.named_buffers():
+            >>>    if name in ['running_var']:
+            >>>        print(buf.size())
+
+        """
+        gen = self._named_members(
+            lambda module: module._buffers.items(),
+            prefix=prefix, recurse=recurse)
+        for elem in gen:
+            yield elem
+
+    def children(self) -> Iterator['Module']:
+        r"""Returns an iterator over immediate children modules.
+        返回所有子模块的迭代器。
+
+        Yields:
+            Module: a child module
+        """
+        for name, module in self.named_children():
+            yield module
+
+    def named_children(self) -> Iterator[Tuple[str, 'Module']]:
+        """
+            def named_children(self)
+
+        """
+        r"""Returns an iterator over immediate children modules, yielding both
+        the name of the module as well as the module itself.
+        返回所有子模块名称和模块本身的元组迭代器
+
+        Yields:
+            (string, Module): Tuple containing a name and child module
+            包含子模块名称和子模块的元组
+
+        Example::
+
+            >>> for name, module in model.named_children():
+            >>>     if name in ['conv4', 'conv5']:
+            >>>         print(module)
+
+        """
+        memo = set()
+        for name, module in self._modules.items():
+            if module is not None and module not in memo:
+                memo.add(module)
+                # 这里其实也可以写做"yield module"相当于def children(self)方法
+                # 构建def children(self)方法只是为了用于不同的调用场景
+                yield name, module
+
+    def modules(self) -> Iterator['Module']:
+        r"""Returns an iterator over all modules in the network.
+        返回网络中所有模块（包含主模块和子模块）的迭代器。
+
+        Yields:
+            Module: a module in the network
+
+        Note:
+            Duplicate modules are returned only once. In the following
+            example, ``l`` will be returned only once.
+            重复的模块只返回一次。在下面的示例中，``l``将只返回一次。
+
+        Example::
+
+            >>> l = nn.Linear(2, 2)
+            >>> net = nn.Sequential(l, l)
+            >>> for idx, m in enumerate(net.modules()):
+                    print(idx, '->', m)
+
+            0 -> Sequential(
+              (0): Linear(in_features=2, out_features=2, bias=True)
+              (1): Linear(in_features=2, out_features=2, bias=True)
+            )
+            1 -> Linear(in_features=2, out_features=2, bias=True)
+
+        """
+        for _, module in self.named_modules():
+            yield module
+
+    def named_modules(self, memo: Optional[Set['Module']] = None, prefix: str = '', remove_duplicate: bool = True):
+        r"""Returns an iterator over all modules in the network, yielding
+        both the name of the module as well as the module itself.
+        返回网络中所有模块（包含主模块和子模块）的迭代器，包含模块名和模块本身。
+
+        Args:
+            memo: a memo to store the set of modules already added to the result
+                    一个集合，用于存储已经添加的模块
+            prefix: a prefix that will be added to the name of the module
+                    添加到该模块的名称前缀
+            remove_duplicate: whether to remove the duplicated module instances in the result
+                or not
+                是否删除重复的模块实例结果，默认Ture
+
+        Yields:
+            (string, Module): Tuple of name and module
+
+        Note:
+            Duplicate modules are returned only once. In the following
+            重复的模块只返回一次。
+            example, ``l`` will be returned only once.
+
+        Example::
+
+            >>> l = nn.Linear(2, 2)
+            >>> net = nn.Sequential(l, l)
+                >>> for idx, m in enumerate(net.named_modules()):
+                    print(idx, '->', m)
+
+            0 -> ('', Sequential(
+              (0): Linear(in_features=2, out_features=2, bias=True)
+              (1): Linear(in_features=2, out_features=2, bias=True)
+            ))
+            1 -> ('0', Linear(in_features=2, out_features=2, bias=True))
+
+        """
+
+        if memo is None:
+            memo = set()
+        if self not in memo:
+            if remove_duplicate:
+                memo.add(self)
+            # 生成主模块"前缀和模块本身"
+            yield prefix, self
+
+            # 这里和named_children()方法相似，只是后面需要分开调用子module和子module名称，所以这里没有使用生成器返回子module和子module名称
+            for name, module in self._modules.items():
+                if module is None:
+                    continue
+                # 这里生成子模块的前缀：prefix.name(主模块prefix不为空)或name(主模块prefix为空)
+                submodule_prefix = prefix + ('.' if prefix else '') + name
+
+                # 这里使用的module.named_modules不是self.named_modules(module是self的子模块)
+                # 子模块重复“yield prefix, self”之前的操作，返回层层嵌套所有子模块信息
+                for m in module.named_modules(memo, submodule_prefix, remove_duplicate):
+                    """
+                    if memo is None:# 判断memo是否为空，这里一般不为空
+                        memo = set()
+                    if self not in memo:# 判断子模块是否在memo中（多为不在）
+                        if remove_duplicate:
+                            memo.add(self)# 将子模块添加到memo集合中
+                        # 生成当前子模块"前缀和模块本身"（相当于后面子模块的主模块）
+                        yield prefix, self
+
+                        # 这里和named_children()方法相似，只是后面需要分开调用子module和子module名称，所以这里没有使用生成器返回子module和子module名称
+                        for name, module in self._modules.items():
+                            if module is None:
+                                continue
+                            # 这里生成子模块的前缀：prefix.name(主模块prefix不为空)或prefix''name(主模块prefix为空)
+                            submodule_prefix = prefix + ('.' if prefix else '') + name
+                    """
+                    yield m  # 生成子模块信息
+
+
+# 1.2.3 路径属性访问
     def get_submodule(self, target: str) -> "Module":
         """
         Returns the submodule given by ``target`` if it exists,
@@ -659,6 +1542,185 @@ class Module:
 
         return buffer
 
+
+# 1.2.4 重构属性相关魔法方法
+    def __getattr__(self, name: str) -> Union[Tensor, 'Module']:
+        """
+        重构__getatrr__()方法原因：
+            直接获取self._parameters，self._buffers，self._modules三个成员变量中某个具体参数的值。
+            为了确保 getattr 能访问到所有的属性，nn.Module 重写了 __getattr__ 函数，
+                以访问 self._parameters，self._buffers，self._modules 中的属性。
+            根据 Python 对实例属性的查找规则，当我们调用 module.attribute 的时候，Python 会首先查找 module 的 类及其基类的 __dict__，
+                然后查找这个 object 的 __dict__，最后查找 __getattr__ 函数。
+            因此，虽然 nn.Module 的 __getattr__ 只查找了 self._parameters，self._buffers，self._modules 三个成员变量，
+                但是 getattr(module, 'attribute') 覆盖的范围和 __dir__ 暴露的范围是一致的。
+
+        eg:
+            假定，_parameters={"w1":1, "w2":2, "w3":3},
+                当调用module.w1时值为1，而module.__dict__只是返回包含'_parameters': OrderedDict()键值对的字典，
+                如果要获取和module.w1一样的结果，则为module.__dict__["_parameters"]["w1"]
+
+        """
+        if '_parameters' in self.__dict__:  # 判断_parameters是否在实例属性字典中
+            _parameters = self.__dict__['_parameters']  # 获取属性'_parameters'的OrderedDict字典对象
+            if name in _parameters:  # 判断name是否在OrderedDict字典对象中
+                return _parameters[name]
+        if '_buffers' in self.__dict__:
+            _buffers = self.__dict__['_buffers']
+            if name in _buffers:
+                return _buffers[name]
+        if '_modules' in self.__dict__:
+            modules = self.__dict__['_modules']
+            if name in modules:
+                return modules[name]
+        raise AttributeError("'{}' object has no attribute '{}'".format(
+            type(self).__name__, name))
+
+    def __setattr__(self, name: str, value: Union[Tensor, 'Module']) -> None:
+        """
+        __setattr__是python提供的用于属性赋值的“魔术”方法，在nn.Module中通过重载了此方法，
+        方便对Module类的parameters、buffers以及其他类变量进行修改。
+
+        __setattr__(self, name, value)：当初始化属性时如self.a=a时或修改实例属性如ins.a=1时，会调用到这个函数。
+        每个设置值的方式都会进入这个方法，本质是调用魔法方法self.__setattr__(name,values)。
+
+        在日常的代码开发过程中，更常见的用法是直接通过 self.xxx = xxx 的方式来增加或修改子神经网络模块、
+        parameters、buffers 以及其他一般的 attribute。这种方式本质上会调用 nn.Module 重载的函数 __setattr__
+
+        从源码中有如下观察：
+        1、在增加 self._parameters，self._modules 的时候，会预先调用 remove_from 函数 从其余私有属性中删除对应的 name，
+            这说明 self.dict，self._buffers，self._parameters，self._modules 中的属性应该是互斥的
+        2、self.register_buffer 是唯一给模块增加 buffer的方式，
+            __setattr__ 只能将 self._buffers 中已有的 buffer重新赋值为 None 或者 tensor 。
+            这是因为 buffer 的初始化类型就是 torch.Tensor 或者 None，
+            而不像 parameters 和 module 分别是 nn.Parameter 和 nn.Module 类型
+        3、其实在__setattr__中也是通过 register_parameter 来增加或修改_parameters对象列表参数，
+            若已经在_parameters对象列表中的参数被赋新值的类型不为torch.nn.Parameter，将会报错
+        4、submodule和 buffer是直接使用modules[name] = value或buffers[name] = value修改对应属性参数。
+        5、使用的self.xxx = torch.Tensor()添加普通的attribute，但是这是一种不被推荐的行为
+            因为这样新增的 attribute 既不属于 self._parameters，也不属于 self._buffers，而会被视为普通的 attribute ，
+            结合参数的转换或转移的_apply()实现可以得出将模块进行状态转换的时候，普通attribute会被遗漏进而导致 device 或者 type 不一样的 bug
+
+        Example::
+            >>> import torch
+            >>> import torch.nn as nn
+
+            >>> class Model(nn.Module):
+                >>> def __init__(self, bias=True):
+                    >>> super().__init__()
+                    >>> self.weight1 = nn.Parameter(torch.Tensor(2)) # Parameters对象会被自动地添加到Module类的参数列表
+                    >>> self.weight2 = torch.tensor(2) # 普通参数不会添加到Module类的参数列表
+                    >>> self.register_parameter("weight3", nn.Parameter(torch.Tensor(2)))
+                    >>> model = Model()
+                    >>> model.__dict__
+            {'training': True,
+             '_parameters': OrderedDict([('weight1',
+                           Parameter containing:
+                           tensor([-3.9867e+36,  3.0611e-41], requires_grad=True)),
+                          ('weight3',
+                           Parameter containing:
+                           tensor([-3.7394e+36,  3.0611e-41], requires_grad=True))]),
+             '_buffers': OrderedDict(),
+             '_non_persistent_buffers_set': set(),
+             '_backward_hooks': OrderedDict(),
+             '_is_full_backward_hook': None,
+             '_forward_hooks': OrderedDict(),
+             '_forward_pre_hooks': OrderedDict(),
+             '_state_dict_hooks': OrderedDict(),
+             '_load_state_dict_pre_hooks': OrderedDict(),
+             '_load_state_dict_post_hooks': OrderedDict(),
+             '_modules': OrderedDict(),
+             'weight2': tensor(2)}
+        """
+        def remove_from(*dicts_or_sets):
+            for d in dicts_or_sets:
+                if name in d:
+                    if isinstance(d, dict): # 在字典中
+                        del d[name]
+                    else:# 在集合中
+                        d.discard(name)
+        # 这里只是对_parameters'的参数对象修改、增加或者初始化
+        params = self.__dict__.get('_parameters') # 获取'_parameters'的OrderedDict()字典对象
+        if isinstance(value, Parameter): # 判断value是否是Parameter对象
+            if params is None:
+                raise AttributeError(
+                    "cannot assign parameters before Module.__init__() call")
+            remove_from(self.__dict__, self._buffers, self._modules, self._non_persistent_buffers_set)
+            # 调用register_parameter，将名为name，参数值为value的参数添加到当前模块
+            self.register_parameter(name, value)
+        # 参数值不为空，并且参数值的类型不为torch.nn.Parameter执行该逻辑
+        elif params is not None and name in params:
+            # 如果参数已经在_parameters对象列表，那么更改该参数值的类型只能是torch.nn.Parameter or None
+            if value is not None:
+                raise TypeError("cannot assign '{}' as parameter '{}' "
+                                "(torch.nn.Parameter or None expected)"
+                                .format(torch.typename(value), name))
+
+            # 调用register_parameter，将名为name，参数值为value的参数添加到当前模块
+            self.register_parameter(name, value)
+        else:
+            modules = self.__dict__.get('_modules')# 获取'_modules'的OrderedDict()字典对象
+            if isinstance(value, Module):
+                if modules is None:
+                    raise AttributeError(
+                        "cannot assign module before Module.__init__() call")
+                remove_from(self.__dict__, self._parameters, self._buffers, self._non_persistent_buffers_set)
+                modules[name] = value
+            elif modules is not None and name in modules:
+                if value is not None:
+                    raise TypeError("cannot assign '{}' as child module '{}' "
+                                    "(torch.nn.Module or None expected)"
+                                    .format(torch.typename(value), name))
+                modules[name] = value
+            else:
+                buffers = self.__dict__.get('_buffers')# 获取'_buffers'的OrderedDict()字典对象
+                if buffers is not None and name in buffers:
+                    """
+                        如果要给模块增加 buffer，self.register_buffer 是唯一的方式，
+                        而__setattr__ 只能将 self._buffers 中已有的 buffer重新赋值为 None 或者 torch.Tensor 。
+                        这是因为 buffer 的初始化类型就是 torch.Tensor 或者 None，
+                        而不像 parameters 和 module 分别是 nn.Parameter 和 nn.Module 类型
+                    """
+                    if value is not None and not isinstance(value, torch.Tensor):
+                        raise TypeError("cannot assign '{}' as buffer '{}' "
+                                        "(torch.Tensor or None expected)"
+                                        .format(torch.typename(value), name))
+                    buffers[name] = value
+                else:
+                    # 增加、更改或初始化普通的 attribute（执行setattr()方法）
+                    object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        """
+        __delattr__ 挨个检查 self._parameters、self._buffers、self._modules 和普通的 attribute 并将 name 从中删除。
+        """
+        if name in self._parameters:
+            del self._parameters[name]
+        elif name in self._buffers:
+            del self._buffers[name]
+            self._non_persistent_buffers_set.discard(name)
+        elif name in self._modules:
+            del self._modules[name]
+        else:
+            object.__delattr__(self, name)
+
+    def __dir__(self):
+        """
+            重构__dir__ 函数将 self._modules、self._parameters 和 self._buffers 中的 attributes 给暴露出来。
+        """
+        module_attrs = dir(self.__class__)  # 获取当前类(和继承类)属性和方法（不包含类实例属性【成员变量属性】）
+        attrs = list(self.__dict__.keys())  # 获取当前类实例属性【成员变量属性】
+        parameters = list(self._parameters.keys())  # 获取__getattr__()方法重载的_parameters实例属性中所有键
+        modules = list(self._modules.keys())   # 获取__getattr__()方法重载的_modules实例属性中所有键
+        buffers = list(self._buffers.keys())   # 获取__getattr__()方法重载的_buffers实例属性中所有键
+        keys = module_attrs + attrs + parameters + modules + buffers
+
+        # Eliminate attrs that are not legal Python variable names
+        keys = [key for key in keys if not key[0].isdigit()]
+
+        return sorted(keys)
+
+
     def get_extra_state(self) -> Any:
         """
         Returns any extra state to include in the module's state_dict.
@@ -694,458 +1756,7 @@ class Module:
             "Please file an issue at https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml "
             "to report this bug.")
 
-    def _apply(self, fn):
-        """
-            def cpu()和def GPU()都是通过 self._apply(function) 配合def to()方法来实现的，
-            function 一般是 lambda 表达式或其他自定义函数。因此，用户其实也可以通过 self._apply(function) 来实现一些特殊的转换。
-            self._apply() 函数实际上做了如下 3 件事情，最终将 function 完整地应用于整个模块。
-                1、通过 self.children() 进行递归的调用
-                2、对 self._parameters 中的参数及其 gradient 通过 function 进行处理
-                3、对 self._buffers 中的 buffer 逐个通过 function 来进行处理
 
-            apply 函数和 _apply 函数的区别在于，_apply() 是专门针对 parameter 和 buffer 而实现的一个“仅供内部使用”的接口，
-            但是 apply 函数是“公有”接口 。apply 实际上可以通过修改 fn 来实现 _apply 能实现的功能，同时还可以实现其他功能。
-            self._apply(lambda t: t.cuda(device))
-        """
-        """
-        其实遍历parameter，用apply也是可以实现的，不过这里还是重新写了一个_apply。
-        _apply对参数和参数的梯度都用fn处理了一遍。
-        处理完还需要用compute_should_use_set_data判断一下，是否需要替换原先的参数。
-        """
-        # 对所有子module递归调用_apply()方法
-        for module in self.children():
-            # 对子模块递归调用fn方法,如lambda t: t.cuda(device)方法将模型转移到GPU
-            module._apply(fn)
-        """
-            在PyTorch 1.1.0之前，学习率调度程序应该在优化器更新之前调用；1.1.0以一种BC-breaking的方式改变了这种行为。
-            如果您在优化器更新（调用optimizer.step()）之前使用学习率调度程序（调用scheduler.step()），这将跳过学习率调度程序的第一个值。
-            如果您在升级到PyTorch 1.1.0之后无法复现原有结果，请检查是否在错误的时间调用了scheduler.step()。
-        """
-        #   为了 BC-breaking 新增一个 tensor 类型判断
-        def compute_should_use_set_data(tensor, tensor_applied):
-            if torch._has_compatible_shallow_copy_type(tensor, tensor_applied): # 新张量兼容现有张量执行该逻辑
-                """
-                    如果新的张量兼容现有的张量，可使用".data="就地更改张量，并且在未来的行为中也是重写这个已经存在的张量。
-                    然而，如果执行BC-breaking改变当前的行为，并且希望这种改变可以在未来的版本中实现，
-                    所以引入`torch.__future__.get_overwrite_module_params_on_conversion()`这个全局标记，
-                    让用户控制在未来版本中重写新张量。
-                    
-                    BC-breaking并不是在这个方法中实现，这里只是一个BC-breaking方法执行后的张量判断
-                """
-                # If the new tensor has compatible tensor type as the existing tensor,
-                # 如果新的张量有兼容的张量类型作为现有的张量
-                # the current behavior is to change the tensor in-place using `.data =`,
-                # 当前的行为是使用".data="就地更改张量
-                # and the future behavior is to overwrite the existing tensor. However,
-                # 并且未来的行为是重写这个已经存在的张量
-                # changing the current behavior is a BC-breaking change, and we want it
-                # 然而，改变当前的行为是一个BC-breaking改变
-                # to happen in future releases. So for now we introduce the
-                # 我们希望它在未来的版本中出现
-                # `torch.__future__.get_overwrite_module_params_on_conversion()`
-                # 所以现在我们引入`torch.__future__.get_overwrite_module_params_on_conversion()`
-                # global flag to let the user control whether they want the future
-                # behavior of overwriting the existing tensor or not.
-                # 全局标志，让用户控制他们未来是否想要重写现有张量的。
-                """
-                torch.__future__方法说明：
-                当使用下面的方法转换一个nn.Module的时候：
-                    1. `module.cuda()` / `.cpu()` (for moving `module` between devices)
-                    2. `module.float()` / `.double()` / `.half()` (for converting `module` to a different dtype)
-                    3. `module.to()` / `.type()` (for changing `module`'s device or dtype)
-                    4. `module._apply(fn)` (for generic functions applied to `module`)
-                这个全局标记控制是否为参数分配新的张量，而不是就地更改这个存在的参数，默认为False
-                """
-                return not torch.__future__.get_overwrite_module_params_on_conversion()
-            else:   # 新张量不兼容现有张量执行该逻辑
-                return False
-
-        # 处理参数及其gradint
-        for key, param in self._parameters.items():
-            if param is None:
-                continue
-            # Tensors stored in modules are graph leaves, and we don't want to
-            # track autograd history of `param_applied`, so we have to use
-            # `with torch.no_grad():`
-            with torch.no_grad():
-                # 对参数调用fn进行处理，得到param_applied
-                param_applied = fn(param)
-            # 用compute_should_use_set_data判断一下，是否需要替换原先的参数
-            should_use_set_data = compute_should_use_set_data(param, param_applied)
-            if should_use_set_data:
-                param.data = param_applied  # 就地更改param.data
-                out_param = param
-            else:
-                assert isinstance(param, Parameter)
-                assert param.is_leaf
-                # 用param_applied重新设置
-                out_param = Parameter(param_applied, param.requires_grad)
-                self._parameters[key] = out_param
-
-            if param.grad is not None:  # 如果参数有梯度
-                with torch.no_grad():
-                    grad_applied = fn(param.grad)   # 对参数的grad调用fn进行处理
-                # 用compute_should_use_set_data判断一下，是否需要替换原先的param.grad
-                should_use_set_data = compute_should_use_set_data(param.grad, grad_applied)
-                if should_use_set_data:
-                    out_param.grad.data = grad_applied  # 就地更改out_param.grad.data
-                else:
-                    assert param.grad.is_leaf
-                    # 用param.grad.requires_grad重新设置
-                    out_param.grad = grad_applied.requires_grad_(param.grad.requires_grad)
-
-        # 遍历 buffers
-        for key, buf in self._buffers.items():
-            if buf is not None:
-                self._buffers[key] = fn(buf)    # 对buf调用fn进行处理
-
-        return self
-
-        """
-            apply 函数 与 _apply() 函数不同的是，apply 函数只是简单地递归调用了 self.children() 去处理自己以及子模块.
-        """
-    def apply(self: T, fn: Callable[['Module'], None]) -> T:
-        r"""Applies ``fn`` recursively to every submodule (as returned by ``.children()``)
-        as well as self. Typical use includes initializing the parameters of a model
-        (see also :ref:`nn-init-doc`).
-        递归地将fn函数应用于每个子模块(由.children()返回) 和 self。典型的用法包括初始化模型的参数(参见torch.nn.init)。
-
-        Args:
-            fn (:class:`Module` -> None): function to be applied to each submodule
-            用于每个子模块的函数，中间的参数必然是子模块！如果用于参数的初始化，那么就递归该模块下的各个函数
-
-        Returns:
-            Module: self
-
-        Example::
-            经常用于初始化init_weights的操作
-            >>> @torch.no_grad()
-            >>> def init_weights(m):
-            >>>     print(m)
-            >>>     if type(m) == nn.Linear:
-            >>>         m.weight.fill_(1.0)
-            >>>         print(m.weight)
-            >>> net = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
-            >>> net.apply(init_weights)
-            Linear(in_features=2, out_features=2, bias=True)
-            Parameter containing:
-            tensor([[ 1.,  1.],
-                    [ 1.,  1.]])
-            Linear(in_features=2, out_features=2, bias=True)
-            Parameter containing:
-            tensor([[ 1.,  1.],
-                    [ 1.,  1.]])
-            Sequential(
-              (0): Linear(in_features=2, out_features=2, bias=True)
-              (1): Linear(in_features=2, out_features=2, bias=True)
-            )
-            Sequential(
-              (0): Linear(in_features=2, out_features=2, bias=True)
-              (1): Linear(in_features=2, out_features=2, bias=True)
-            )
-        """
-        for module in self.children():
-            module.apply(fn) # 对该模块的子模块调用fn方法
-        fn(self) # 对当前主模型调用fn方法
-        return self
-
-    """
-        参数的转换或转移
-    
-        nn.Module 实现了如下 8 个常用函数将模块转变成 float16 等类型、转移到 CPU/ GPU上。
-            1、CPU：将所有 parameters 和 buffer 转移到 CPU 上
-            2、type：将所有 parameters 和 buffer 转变成另一个类型
-            3、CUDA：将所有 parameters 和 buffer 转移到 GPU 上
-            4、float：将所有浮点类型的 parameters 和 buffer 转变成 float32 类型
-            5、double：将所有浮点类型的 parameters 和 buffer 转变成 double 类型
-            6、half：将所有浮点类型的 parameters 和 buffer 转变成 float16 类型
-            7、bfloat16：将所有浮点类型的 parameters 和 buffer 转变成 bfloat16 类型
-            8、to：移动模块或/和改变模块的类型
-        
-        这些函数的功能最终都是通过 self._apply(function) 来实现的， function 一般是 lambda 表达式或其他自定义函数。
-        因此，用户其实也可以通过 self._apply(function) 来实现一些特殊的转换。self._apply() 函数实际上做了如下 3 件事情，最终将 function 完整地应用于整个模块。
-            1、通过 self.children() 进行递归的调用
-            2、对 self._parameters 中的参数及其 gradient 通过 function 进行处理
-            3、对 self._buffers 中的 buffer 逐个通过 function 来进行处理
-    
-    """
-    def cuda(self: T, device: Optional[Union[int, device]] = None) -> T:
-        r"""Moves all model parameters and buffers to the GPU.
-        将所有模型参数和缓冲区移动到GPU。
-
-        This also makes associated parameters and buffers different objects. So
-        it should be called before constructing optimizer if the module will
-        live on GPU while being optimized.
-        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在GPU上时被优化，那么它应该在构建优化器之前被调用
-
-        .. note::
-            This method modifies the module in-place.
-            同样的，此方法将就地修改模块。
-
-        Args:
-            device (int, optional): if specified, all parameters will be
-                copied to that device
-            如果指定了，所有参数将被复制到该设备
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.cuda(device))
-
-    def ipu(self: T, device: Optional[Union[int, device]] = None) -> T:
-        r"""Moves all model parameters and buffers to the IPU.
-
-        This also makes associated parameters and buffers different objects. So
-        it should be called before constructing optimizer if the module will
-        live on IPU while being optimized.
-        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在IPU上时被优化，那么它应该在构建优化器之前被调用
-
-        .. note::
-            This method modifies the module in-place.
-
-        Arguments:
-            device (int, optional): if specified, all parameters will be
-                copied to that device
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.ipu(device))
-
-    def xpu(self: T, device: Optional[Union[int, device]] = None) -> T:
-        r"""Moves all model parameters and buffers to the XPU.
-
-        This also makes associated parameters and buffers different objects. So
-        it should be called before constructing optimizer if the module will
-        live on XPU while being optimized.
-        这也使得相关的参数和缓冲区成为不同的对象。如果模块驻留在XPU上时被优化，那么它应该在构建优化器之前被调用
-
-        .. note::
-            This method modifies the module in-place.
-
-        Arguments:
-            device (int, optional): if specified, all parameters will be
-                copied to that device
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.xpu(device))
-
-    def cpu(self: T) -> T:
-        r"""Moves all model parameters and buffers to the CPU.
-        将所有模型参数和缓冲区移动到CPU。
-
-        .. note::
-            This method modifies the module in-place.
-            此方法将就地修改模块（应该当前代码之前的所有立刻移动到别处）。
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.cpu())
-
-    def type(self: T, dst_type: Union[dtype, str]) -> T:
-        r"""Casts all parameters and buffers to :attr:`dst_type`.
-
-        .. note::
-            This method modifies the module in-place.
-
-        Args:
-            dst_type (type or string): the desired type
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.type(dst_type))
-
-    def float(self: T) -> T:
-        r"""Casts all floating point parameters and buffers to ``float`` datatype.
-        将所有浮点参数和缓冲区强制转换为浮点数据类型。
-
-        .. note::
-            This method modifies the module in-place.
-            此方法将就地修改模块。
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.float() if t.is_floating_point() else t)
-
-    def double(self: T) -> T:
-        r"""Casts all floating point parameters and buffers to ``double`` datatype.
-
-        .. note::
-            This method modifies the module in-place.
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.double() if t.is_floating_point() else t)
-
-    def half(self: T) -> T:
-        r"""Casts all floating point parameters and buffers to ``half`` datatype.
-
-        .. note::
-            This method modifies the module in-place.
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.half() if t.is_floating_point() else t)
-
-    def bfloat16(self: T) -> T:
-        r"""Casts all floating point parameters and buffers to ``bfloat16`` datatype.
-
-        .. note::
-            This method modifies the module in-place.
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: t.bfloat16() if t.is_floating_point() else t)
-
-    def to_empty(self: T, *, device: Union[str, device]) -> T:
-        r"""Moves the parameters and buffers to the specified device without copying storage.
-
-        Args:
-            device (:class:`torch.device`): The desired device of the parameters
-                and buffers in this module.
-
-        Returns:
-            Module: self
-        """
-        return self._apply(lambda t: torch.empty_like(t, device=device))
-
-    @overload
-    def to(self: T, device: Optional[Union[int, device]] = ..., dtype: Optional[Union[dtype, str]] = ...,
-           non_blocking: bool = ...) -> T:
-        ...
-
-    @overload
-    def to(self: T, dtype: Union[dtype, str], non_blocking: bool = ...) -> T:
-        ...
-
-    @overload
-    def to(self: T, tensor: Tensor, non_blocking: bool = ...) -> T:
-        ...
-
-    def to(self, *args, **kwargs):
-        r"""Moves and/or casts the parameters and buffers.
-            移动和/或强制转换参数和缓冲区。
-
-        This can be called as
-
-        .. function:: to(device=None, dtype=None, non_blocking=False)
-           :noindex:
-
-        .. function:: to(dtype, non_blocking=False)
-           :noindex:
-
-        .. function:: to(tensor, non_blocking=False)
-           :noindex:
-
-        .. function:: to(memory_format=torch.channels_last)
-           :noindex:
-
-        Its signature is similar to :meth:`torch.Tensor.to`, but only accepts
-        floating point or complex :attr:`dtype`\ s. In addition, this method will
-        only cast the floating point or complex parameters and buffers to :attr:`dtype`
-        (if given).
-        它的签名类似于torch.Tensor.to()，但只接受浮点数或复杂的dtype’s。
-        此外，该方法只将浮点数或复杂参数和缓冲区强制转换为:attr: ’ dtype(如果给定)。
-        The integral parameters and buffers will be moved
-        :attr:`device`, if that is given, but with dtypes unchanged. When
-        :attr:`non_blocking` is set, it tries to convert/move asynchronously
-        with respect to the host if possible, e.g., moving CPU Tensors with
-        pinned memory to CUDA devices.
-        如果给定，整型参数和缓冲区将被移到device，但dtype不变。当设置non_blocking时，
-        如果可能的话，它会尝试相对于主机进行异步转换/移动，例如，将带有固定内存的CPU张量移动到CUDA设备。
-
-        See below for examples.
-
-        .. note::
-            This method modifies the module in-place.
-            此方法将就地修改模块。
-
-        Args:
-            device (:class:`torch.device`): the desired device of the parameters
-                and buffers in this module
-                在这个模块中参数和缓冲器的期望设备
-            dtype (:class:`torch.dtype`): the desired floating point or complex dtype of
-                the parameters and buffers in this module
-                这个模块中参数和缓冲区的浮点型或复杂的Dtype
-            tensor (torch.Tensor): Tensor whose dtype and device are the desired
-                dtype and device for all parameters and buffers in this module
-                张量的dtype和设备是这个模块中所有参数和缓冲区所需的dtype和设备
-            memory_format (:class:`torch.memory_format`): the desired memory
-                format for 4D parameters and buffers in this module (keyword
-                only argument)
-                该模块中4D参数和缓冲区所需的内存格式(仅关键字参数)
-
-        Returns:
-            Module: self
-
-        Examples::
-
-            >>> linear = nn.Linear(2, 2)
-            >>> linear.weight
-            Parameter containing:
-            tensor([[ 0.1913, -0.3420],
-                    [-0.5113, -0.2325]])
-            >>> linear.to(torch.double)
-            Linear(in_features=2, out_features=2, bias=True)
-            >>> linear.weight
-            Parameter containing:
-            tensor([[ 0.1913, -0.3420],
-                    [-0.5113, -0.2325]], dtype=torch.float64)
-            >>> gpu1 = torch.device("cuda:1")
-            >>> linear.to(gpu1, dtype=torch.half, non_blocking=True)
-            Linear(in_features=2, out_features=2, bias=True)
-            >>> linear.weight
-            Parameter containing:
-            tensor([[ 0.1914, -0.3420],
-                    [-0.5112, -0.2324]], dtype=torch.float16, device='cuda:1')
-            >>> cpu = torch.device("cpu")
-            >>> linear.to(cpu)
-            Linear(in_features=2, out_features=2, bias=True)
-            >>> linear.weight
-            Parameter containing:
-            tensor([[ 0.1914, -0.3420],
-                    [-0.5112, -0.2324]], dtype=torch.float16)
-
-            >>> linear = nn.Linear(2, 2, bias=None).to(torch.cdouble)
-            >>> linear.weight
-            Parameter containing:
-            tensor([[ 0.3741+0.j,  0.2382+0.j],
-                    [ 0.5593+0.j, -0.4443+0.j]], dtype=torch.complex128)
-            >>> linear(torch.ones(3, 2, dtype=torch.cdouble))
-            tensor([[0.6122+0.j, 0.1150+0.j],
-                    [0.6122+0.j, 0.1150+0.j],
-                    [0.6122+0.j, 0.1150+0.j]], dtype=torch.complex128)
-
-        """
-
-        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
-
-        if dtype is not None:
-            if not (dtype.is_floating_point or dtype.is_complex):
-                raise TypeError('nn.Module.to only accepts floating point or complex '
-                                'dtypes, but got desired dtype={}'.format(dtype))
-            if dtype.is_complex:
-                warnings.warn(
-                    "Complex modules are a new feature under active development whose design may change, "
-                    "and some modules might not work as expected when using complex tensors as parameters or buffers. "
-                    "Please file an issue at https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml "
-                    "if a complex module does not work as expected.")
-
-        def convert(t):
-            if convert_to_format is not None and t.dim() in (4, 5):
-                return t.to(device, dtype if t.is_floating_point() or t.is_complex() else None,
-                            non_blocking, memory_format=convert_to_format)
-            return t.to(device, dtype if t.is_floating_point() or t.is_complex() else None, non_blocking)
-
-        return self._apply(convert)
 
     """
     hook方法:
@@ -1567,117 +2178,6 @@ class Module:
         if '_is_full_backward_hook' not in self.__dict__:
             self._is_full_backward_hook = None
 
-    def __getattr__(self, name: str) -> Union[Tensor, 'Module']:
-        """
-        __getatrr__()方法直接获取self._parameters，self._buffers，self._modules三个成员变量中某个具体参数的值。
-        假定，_parameters={"w1":1, "w2":2, "w3":3},当调用module.w1时值为1，
-            而module.__dict__只是返回包含'_parameters': OrderedDict()键值对的字典，
-            如果要获取和module.w1一样的结果，则为module.__dict__["_parameters"]["w1"]
-
-        为了确保 getattr 能访问到所有的属性，nn.Module 也重写了 __getattr__ 函数，以访问 self._parameters，self._buffers，self._modules 中的属性。
-        根据 Python 对实例属性的查找规则，当我们调用 module.attribute 的时候，Python 会首先查找 module 的 类及其基类的 __dict__，然后查找这个 object 的 __dict__，最后查找 __getattr__ 函数。
-        因此，虽然 nn.Module 的 __getattr__ 只查找了 self._parameters，self._buffers，self._modules 三个成员变量，但是 getattr(module, 'attribute') 覆盖的范围和 __dir__ 暴露的范围是一致的。
-        """
-        if '_parameters' in self.__dict__:  # 判断_parameters是否在实例属性字典中
-            _parameters = self.__dict__['_parameters']  # 获取属性'_parameters'的OrderedDict字典对象
-            if name in _parameters:  # 判断name是否在OrderedDict字典对象中
-                return _parameters[name]
-        if '_buffers' in self.__dict__:
-            _buffers = self.__dict__['_buffers']
-            if name in _buffers:
-                return _buffers[name]
-        if '_modules' in self.__dict__:
-            modules = self.__dict__['_modules']
-            if name in modules:
-                return modules[name]
-        raise AttributeError("'{}' object has no attribute '{}'".format(
-            type(self).__name__, name))
-
-    def __setattr__(self, name: str, value: Union[Tensor, 'Module']) -> None:
-        """
-        在日常的代码开发过程中，更常见的用法是直接通过 self.xxx = xxx 的方式来增加或修改子神经网络模块、p
-        arameters、buffers 以及其他一般的 attribute。这种方式本质上会调用 nn.Module 重载的函数 __setattr__
-
-        从源码中有如下观察：
-        1、函数检查了继承 nn.Module 的自定义模块是否有正确地初始化父类 nn.Module，这也说明了 super().__init__() 的必要性
-        2、在增加 self._parameters，self._modules 的时候，会预先调用 remove_from 函数 从其余私有属性中删除对应的 name，
-            这说明 self.dict，self._buffers，self._parameters，self._modules 中的属性应该是互斥的
-        3、如果要给模块增加 buffer，self.register_buffer 是唯一的方式，__setattr__ 只能将 self._buffers 中已有的 buffer
-            重新赋值为 None 或者 tensor 。这是因为 buffer 的初始化类型就是 torch.Tensor 或者 None，
-            而不像 parameters 和 module 分别是 nn.Parameter 和 nn.Module 类型
-        4、除了其他普通的 attribute，最终 parameters 还是会在 __setattr__ 中通过 register_parameter 来增加，
-            但是子神经网络模块和 buffer 是直接修改的 self._modules 和 self._buffers
-        5、由第三点和前文所述的 _apply 实现可以得出 self.xxx = torch.Tensor() 是一种不被推荐的行为，
-            因为这样新增的 attribute 既不属于 self._parameters，也不属于 self._buffers，
-            而会被视为普通的 attribute ，在将模块进行状态转换的时候，self.xxx 会被遗漏进而导致 device 或者 type 不一样的 bug
-
-        """
-        def remove_from(*dicts_or_sets):
-            for d in dicts_or_sets:
-                if name in d:
-                    if isinstance(d, dict): # 在字典中
-                        del d[name]
-                    else:# 在集合中
-                        d.discard(name)
-
-        params = self.__dict__.get('_parameters') # 获取'_parameters'的OrderedDict()字典对象
-        if isinstance(value, Parameter): # 判断value是否是Parameter对象
-            if params is None:
-                raise AttributeError(
-                    "cannot assign parameters before Module.__init__() call")
-            # params为None，调用Module.__init__()之前，需要先将键为name的参数删除，保证调用调用register_parameter方法不会抛出异常
-            # 因为if param is None:
-            #       self._parameters[name] = None
-            # 否则抛出异常："cannot assign '{}' object to parameter '{}' ""(torch.nn.Parameter or None required)"
-            remove_from(self.__dict__, self._buffers, self._modules, self._non_persistent_buffers_set)
-            # 调用register_parameter，将名为name，参数值为value的参数添加到当前模块
-            self.register_parameter(name, value)
-        elif params is not None and name in params:
-            if value is not None:
-                raise TypeError("cannot assign '{}' as parameter '{}' "
-                                "(torch.nn.Parameter or None expected)"
-                                .format(torch.typename(value), name))
-
-            # 调用register_parameter，将名为name，参数值为value的参数添加到当前模块
-            self.register_parameter(name, value)
-        else:
-            modules = self.__dict__.get('_modules')# 获取'_modules'的OrderedDict()字典对象
-            if isinstance(value, Module):
-                if modules is None:
-                    raise AttributeError(
-                        "cannot assign module before Module.__init__() call")
-                remove_from(self.__dict__, self._parameters, self._buffers, self._non_persistent_buffers_set)
-                modules[name] = value
-            elif modules is not None and name in modules:
-                if value is not None:
-                    raise TypeError("cannot assign '{}' as child module '{}' "
-                                    "(torch.nn.Module or None expected)"
-                                    .format(torch.typename(value), name))
-                modules[name] = value
-            else:
-                buffers = self.__dict__.get('_buffers')# 获取'_buffers'的OrderedDict()字典对象
-                if buffers is not None and name in buffers:
-                    if value is not None and not isinstance(value, torch.Tensor):
-                        raise TypeError("cannot assign '{}' as buffer '{}' "
-                                        "(torch.Tensor or None expected)"
-                                        .format(torch.typename(value), name))
-                    buffers[name] = value
-                else:
-                    object.__setattr__(self, name, value)
-
-    def __delattr__(self, name):
-        """
-        __delattr__ 会挨个检查 self._parameters、self._buffers、self._modules 和普通的 attribute 并将 name 从中删除。
-        """
-        if name in self._parameters:
-            del self._parameters[name]
-        elif name in self._buffers:
-            del self._buffers[name]
-            self._non_persistent_buffers_set.discard(name)
-        elif name in self._modules:
-            del self._modules[name]
-        else:
-            object.__delattr__(self, name)
 
     def _register_state_dict_hook(self, hook):
         r"""These hooks will be called with arguments: `self`, `state_dict`,
@@ -2086,408 +2586,8 @@ class Module:
                 self.__class__.__name__, "\n\t".join(error_msgs)))
         return _IncompatibleKeys(missing_keys, unexpected_keys)
 
-    def _named_members(self, get_members_fn, prefix='', recurse=True):
-        r"""Helper method for yielding various names + members of modules.
-        产生各种名称的成员模块的辅助方法，该方法的目的是为了确定是获取当前模块还是所有模块的属性的名称和值
-        """
-        memo = set()
-        # 三元表达式，如果为recurse=True，返回所有模块，如果为False仅返回当前模块
-        modules = self.named_modules(prefix=prefix) if recurse else [(prefix, self)]
-        for module_prefix, module in modules:
-            # 使用lambda方法获取模块某个属性的名称和值的字典，并赋值给members
-            # get_members_fn(module) = lambda module: module._parameters.items()
-            # 或get_members_fn(module) = lambda module: module._buffers.items()
-            members = get_members_fn(module)
-            for k, v in members:
-                if v is None or v in memo:
-                    continue
-                memo.add(v)
-                name = module_prefix + ('.' if module_prefix else '') + k
-                yield name, v # 返回属性的名称和值的生成器
-    """
-    常见的属性访问方法
 
-    nn.Module 中的常用函数包括下面 8 个，他们都会返回一个迭代器用于访问模块中的 buffer，parameter，子模块等。他们的功能与区别如下
-        1、parameters：调用 self.named_parameters 并返回模型参数，被应用于 self.requires_grad_ 和 self.zero_grad 函数中
-        2、named_parameters：返回 self._parameters 中的 name 和 parameter 元组，如果 recurse=True 还会返回子模块中的模型参数
-        3、buffers：调用 self.named_buffers 并返回模型参数
-        4、named_buffers：返回 self._buffers 中的 name 和 buffer 元组，如果 recurse=True 还会返回子模块中的模型 buffer
-        5、children：调用 self.named_children，只返回 self._modules 中的模块，被应用于 self.train 函数中
-        6、named_children：只返回 self._modules 中的 name 和 module 元组
-        7、modules：调用 self.named_modules 并返回各个 module 但不返回 name
-        8、named_modules：返回 self._modules 下的 name 和 module 元组，并递归调用和返回 module.named_modules
-    
-    named_parameters 和 named_buffers 都是调用的 self._named_members 实现的，
-    named_modules 和 named_children 虽然有自己的实现，但和 self._named_members 一样，
-    都是通过 set 类型的 memo 来记录已经抛出的模块，如果 member 不在 memo 中，
-    才会将 member 抛出并将 member 放入 memo 中，因此 named_parameters、named_buffers、
-    named_modules 和named_children 都不会返回重复的 parameter、 buffer 或 module。
 
-    """
-    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
-        r"""Returns an iterator over module parameters.
-            返回模块参数上的迭代器。
-
-        This is typically passed to an optimizer.
-        这通常被传递给优化器。
-
-        Args:
-            recurse (bool): if True, then yields parameters of this module
-                and all submodules. Otherwise, yields only parameters that
-                are direct members of this module.
-                如果为True，则生成该模块和所有子模块的参数。否则，只生成该模块的直接成员参数。
-
-        Yields:
-            Parameter: module parameter
-
-        Example::
-
-            >>> for param in model.parameters():
-            >>>     print(type(param), param.size())
-            <class 'torch.Tensor'> (20L,)
-            <class 'torch.Tensor'> (20L, 1L, 5L, 5L)
-
-        """
-        for name, param in self.named_parameters(recurse=recurse):
-            yield param
-
-    def named_parameters(self, prefix: str = '', recurse: bool = True) -> Iterator[Tuple[str, Parameter]]:
-        r"""Returns an iterator over module parameters, yielding both the
-        name of the parameter as well as the parameter itself.
-        返回模块参数迭代器，产生参数名称和参数值
-
-        Args:
-            prefix (str): prefix to prepend to all parameter names.
-            recurse (bool): if True, then yields parameters of this module
-                and all submodules. Otherwise, yields only parameters that
-                are direct members of this module.
-                如果为True，生成该模块和所有子模块的参数迭代器，如果为False，仅返回当前模块
-
-        Yields:
-            (string, Parameter): Tuple containing the name and parameter
-
-        Example::
-
-            >>> for name, param in self.named_parameters():
-            >>>    if name in ['bias']:
-            >>>        print(param.size())
-
-        """
-        gen = self._named_members(
-            lambda module: module._parameters.items(),
-            prefix=prefix, recurse=recurse)
-        for elem in gen:
-            yield elem
-
-    def buffers(self, recurse: bool = True) -> Iterator[Tensor]:
-        r"""Returns an iterator over module buffers.
-        返回一个模块缓冲区迭代器
-
-        Args:
-            recurse (bool): if True, then yields buffers of this module
-                and all submodules. Otherwise, yields only buffers that
-                are direct members of this module.
-            如果为True，生成该模块和所有子模块的buffers迭代器，如果为False，仅返回当前模块
-        Yields:
-            torch.Tensor: module buffer
-
-        Example::
-
-            >>> for buf in model.buffers():
-            >>>     print(type(buf), buf.size())
-            <class 'torch.Tensor'> (20L,)
-            <class 'torch.Tensor'> (20L, 1L, 5L, 5L)
-
-        """
-        for _, buf in self.named_buffers(recurse=recurse):
-            yield buf
-
-    def named_buffers(self, prefix: str = '', recurse: bool = True) -> Iterator[Tuple[str, Tensor]]:
-        r"""Returns an iterator over module buffers, yielding both the
-        name of the buffer as well as the buffer itself.
-        返回模块缓冲区迭代器，生成缓冲区名称和缓冲区值
-        Args:
-            prefix (str): prefix to prepend to all buffer names.
-            recurse (bool): if True, then yields buffers of this module
-                and all submodules. Otherwise, yields only buffers that
-                are direct members of this module.
-            如果为True，生成该模块和所有子模块的buffers迭代器，如果为False，仅返回当前模块
-
-        Yields:
-            (string, torch.Tensor): Tuple containing the name and buffer
-
-        Example::
-
-            >>> for name, buf in self.named_buffers():
-            >>>    if name in ['running_var']:
-            >>>        print(buf.size())
-
-        """
-        gen = self._named_members(
-            lambda module: module._buffers.items(),
-            prefix=prefix, recurse=recurse)
-        for elem in gen:
-            yield elem
-
-    def children(self) -> Iterator['Module']:
-        r"""Returns an iterator over immediate children modules.
-        返回所有子模块的迭代器。
-
-        Yields:
-            Module: a child module
-        """
-        for name, module in self.named_children():
-            yield module
-
-    def named_children(self) -> Iterator[Tuple[str, 'Module']]:
-        """
-            def named_children(self)
-
-        """
-        r"""Returns an iterator over immediate children modules, yielding both
-        the name of the module as well as the module itself.
-        返回所有子模块名称和模块本身的元组迭代器
-
-        Yields:
-            (string, Module): Tuple containing a name and child module
-            包含子模块名称和子模块的元组
-
-        Example::
-
-            >>> for name, module in model.named_children():
-            >>>     if name in ['conv4', 'conv5']:
-            >>>         print(module)
-
-        """
-        memo = set()
-        for name, module in self._modules.items():
-            if module is not None and module not in memo:
-                memo.add(module)
-                # 这里其实也可以写做"yield module"相当于def children(self)方法
-                # 构建def children(self)方法只是为了用于不同的调用场景
-                yield name, module
-
-    def modules(self) -> Iterator['Module']:
-        r"""Returns an iterator over all modules in the network.
-        返回网络中所有模块（包含主模块和子模块）的迭代器。
-
-        Yields:
-            Module: a module in the network
-
-        Note:
-            Duplicate modules are returned only once. In the following
-            example, ``l`` will be returned only once.
-            重复的模块只返回一次。在下面的示例中，``l``将只返回一次。
-
-        Example::
-
-            >>> l = nn.Linear(2, 2)
-            >>> net = nn.Sequential(l, l)
-            >>> for idx, m in enumerate(net.modules()):
-                    print(idx, '->', m)
-
-            0 -> Sequential(
-              (0): Linear(in_features=2, out_features=2, bias=True)
-              (1): Linear(in_features=2, out_features=2, bias=True)
-            )
-            1 -> Linear(in_features=2, out_features=2, bias=True)
-
-        """
-        for _, module in self.named_modules():
-            yield module
-
-    def named_modules(self, memo: Optional[Set['Module']] = None, prefix: str = '', remove_duplicate: bool = True):
-        r"""Returns an iterator over all modules in the network, yielding
-        both the name of the module as well as the module itself.
-        返回网络中所有模块（包含主模块和子模块）的迭代器，包含模块名和模块本身。
-
-        Args:
-            memo: a memo to store the set of modules already added to the result
-                    一个集合，用于存储已经添加的模块
-            prefix: a prefix that will be added to the name of the module
-                    添加到该模块的名称前缀
-            remove_duplicate: whether to remove the duplicated module instances in the result
-                or not
-                是否删除重复的模块实例结果，默认Ture
-
-        Yields:
-            (string, Module): Tuple of name and module
-
-        Note:
-            Duplicate modules are returned only once. In the following
-            重复的模块只返回一次。
-            example, ``l`` will be returned only once.
-
-        Example::
-
-            >>> l = nn.Linear(2, 2)
-            >>> net = nn.Sequential(l, l)
-                >>> for idx, m in enumerate(net.named_modules()):
-                    print(idx, '->', m)
-
-            0 -> ('', Sequential(
-              (0): Linear(in_features=2, out_features=2, bias=True)
-              (1): Linear(in_features=2, out_features=2, bias=True)
-            ))
-            1 -> ('0', Linear(in_features=2, out_features=2, bias=True))
-
-        """
-
-        if memo is None:
-            memo = set()
-        if self not in memo:
-            if remove_duplicate:
-                memo.add(self)
-            # 生成主模块"前缀和模块本身"
-            yield prefix, self
-
-            # 这里和named_children()方法相似，只是后面需要分开调用子module和子module名称，所以这里没有使用生成器返回子module和子module名称
-            for name, module in self._modules.items():
-                if module is None:
-                    continue
-                # 这里生成子模块的前缀：prefix.name(主模块prefix不为空)或name(主模块prefix为空)
-                submodule_prefix = prefix + ('.' if prefix else '') + name
-
-                # 这里使用的module.named_modules不是self.named_modules(module是self的子模块)
-                # 子模块重复“yield prefix, self”之前的操作，返回层层嵌套所有子模块信息
-                for m in module.named_modules(memo, submodule_prefix, remove_duplicate):
-                    """
-                    if memo is None:# 判断memo是否为空，这里一般不为空
-                        memo = set()
-                    if self not in memo:# 判断子模块是否在memo中（多为不在）
-                        if remove_duplicate:
-                            memo.add(self)# 将子模块添加到memo集合中
-                        # 生成当前子模块"前缀和模块本身"（相当于后面子模块的主模块）
-                        yield prefix, self
-            
-                        # 这里和named_children()方法相似，只是后面需要分开调用子module和子module名称，所以这里没有使用生成器返回子module和子module名称
-                        for name, module in self._modules.items():
-                            if module is None:
-                                continue
-                            # 这里生成子模块的前缀：prefix.name(主模块prefix不为空)或prefix''name(主模块prefix为空)
-                            submodule_prefix = prefix + ('.' if prefix else '') + name
-                    """
-                    yield m # 生成子模块信息
-
-
-
-    """
-        训练与测试
-
-        nn.Module 通过 self.training 来区分训练和测试两种状态，使得模块可以在训练和测试时有不同的 forward 行为（如 Batch Normalization）。
-        nn.Module 通过 self.train() 和 self.eval() 来修改训练和测试状态，其中 self.eval 直接调用了 self.train(False)，
-        而 self.train() 会修改 self.training 并通过 self.children() 来调整所有子模块的状态。
-
-    """
-    def train(self: T, mode: bool = True) -> T:
-        r"""Sets the module in training mode.
-            将模块设置为训练模式。
-
-        This has any effect only on certain modules. See documentations of
-        particular modules for details of their behaviors in training/evaluation
-        mode, if they are affected, e.g. :class:`Dropout`, :class:`BatchNorm`,
-        etc.
-        这只对某些模块有效。如果他们在训练/评估模式中受到影响，
-        请参阅特定模块的文档以了解他们的行为细节，如Dropout, BatchNorm等。
-
-        Args:
-            mode (bool): whether to set training mode (``True``) or evaluation
-                         mode (``False``). Default: ``True``.
-                         是否设置训练模式(True)或评估模式(False)。默认值:真的。
-
-        Returns:
-            Module: self
-        """
-        if not isinstance(mode, bool):
-            raise ValueError("training mode is expected to be boolean")
-        self.training = mode
-        for module in self.children():# 保证子模块的模式和父模块一致
-            module.train(mode)
-        return self
-
-    def eval(self: T) -> T:
-        r"""Sets the module in evaluation mode.
-        将模块设置为评估模式。
-
-        This has any effect only on certain modules. See documentations of
-        particular modules for details of their behaviors in training/evaluation
-        mode, if they are affected, e.g. :class:`Dropout`, :class:`BatchNorm`,
-        etc.
-        这只对某些模块有效。如果他们在训练/评估模式中受到影响，
-        请参阅特定模块的文档以了解他们的行为细节，如Dropout, BatchNorm等。
-
-        This is equivalent with :meth:`self.train(False) <torch.nn.Module.train>`.
-        同时这和 self.train(False) 是同等的！
-
-        See :ref:`locally-disable-grad-doc` for a comparison between
-        `.eval()` and several similar mechanisms that may be confused with it.
-
-        Returns:
-            Module: self
-        """
-        return self.train(False)
-
-    """
-        梯度的处理
-        
-        对于梯度的处理 nn.Module 有两个相关的函数实现，分别是 requires_grad_ 和 zero_grad 函数，
-        他们都调用了 self.parameters() 来访问所有的参数，并修改参数的 requires_grad 状态 或者 清理参数的梯度。
-    """
-    def requires_grad_(self: T, requires_grad: bool = True) -> T:
-        r"""Change if autograd should record operations on parameters in this
-        module.
-            更改autograd是否应该记录此模块中参数的操作。
-
-        This method sets the parameters' :attr:`requires_grad` attributes
-        in-place.
-        该方法就地设置参数的requires_grad属性。
-
-        This method is helpful for freezing part of the module for finetuning
-        or training parts of a model individually (e.g., GAN training).
-        这种方法有助于冻结模块的一部分，以便对模型的各个部分进行微调或单独训练(如GAN训练)。
-
-        See :ref:`locally-disable-grad-doc` for a comparison between
-        `.requires_grad_()` and several similar mechanisms that may be confused with it.
-        请参阅Locally disabling gradient computation 来比较**.requires_grad_()**和几个可能与之混淆的类似机制。
-
-        Args:
-            requires_grad (bool): whether autograd should record operations on
-                                  parameters in this module. Default: ``True``.
-            autograd是否应该记录对该模块中的参数的操作。默认值:真的。
-        Returns:
-            Module: self
-        """
-        for p in self.parameters():
-            p.requires_grad_(requires_grad)
-        return self
-
-    def zero_grad(self, set_to_none: bool = False) -> None:
-        r"""Sets gradients of all model parameters to zero. See similar function
-        under :class:`torch.optim.Optimizer` for more context.
-        设置所有模型参数的梯度为零。更多内容请查看torch.optim.optimizer下的类似函数。
-
-        Args:
-            set_to_none (bool): instead of setting to zero, set the grads to None.
-                See :meth:`torch.optim.Optimizer.zero_grad` for details.
-            set_to_none (bool) -将梯度值设置为None，而不是设置为零。详见torch. optimizer . optimizer .zero_grad()。
-        """
-        if getattr(self, '_is_replica', False):
-            warnings.warn(
-                "Calling .zero_grad() from a module created with nn.DataParallel() has no effect. "
-                "The parameters are copied (in a differentiable manner) from the original module. "
-                "This means they are not leaf nodes in autograd and so don't accumulate gradients. "
-                "If you need gradients in your forward method, consider using autograd.grad instead.")
-
-        for p in self.parameters():
-            if p.grad is not None:
-                if set_to_none:
-                    p.grad = None
-                else:
-                    if p.grad.grad_fn is not None:
-                        p.grad.detach_()
-                    else:
-                        p.grad.requires_grad_(False)
-                    p.grad.zero_()
 
     def share_memory(self: T) -> T:
         r"""See :meth:`torch.Tensor.share_memory_`"""
@@ -2540,21 +2640,7 @@ class Module:
         main_str += ')'
         return main_str
 
-    def __dir__(self):
-        """
-            重构__dir__ 函数将 self._modules、self._parameters 和 self._buffers 中的 attributes 给暴露出来。
-        """
-        module_attrs = dir(self.__class__)  # 获取当前类(和继承类)属性和方法（不包含类实例属性【成员变量属性】）
-        attrs = list(self.__dict__.keys())  # 获取当前类实例属性【成员变量属性】
-        parameters = list(self._parameters.keys())  # 获取__getattr__()方法重载的实例属性
-        modules = list(self._modules.keys())
-        buffers = list(self._buffers.keys())
-        keys = module_attrs + attrs + parameters + modules + buffers
 
-        # Eliminate attrs that are not legal Python variable names
-        keys = [key for key in keys if not key[0].isdigit()]
-
-        return sorted(keys)
 
     def _replicate_for_data_parallel(self):
         replica = self.__new__(type(self))
