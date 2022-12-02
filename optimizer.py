@@ -1,3 +1,4 @@
+# ************************************* optimizer.py **************************************
 from collections import defaultdict, abc as container_abcs
 
 import torch
@@ -18,14 +19,14 @@ required = _RequiredParameter()
 
 
 class Optimizer(object):
+    # model.cuda()方法将model移到GPU中，这一步要在构造Optimizer之前。因为调用model.cuda()后，model里面的参数已经不是之前的参数了
     """
         Optimizer类有两个重要的成员变量，self.param_groups和self.state。
             self.param_groups用于存储模型参数和优化器本身的一些超参数（如学习率等）。
             self.state用于存储更新过程中模型参数对应的各种临时状态，如MSGD中每个参数需要对应一个动量。
                 而每个参数可能不止需要对应一个临时状态。因此self.state是一个键值对类型为parameter: dict的有序字典。
 
-        add_param_group方法，用来初始化self.param_groups。但self.state的初始化需要在某个具体的优化器子类中进行。
-
+        add_param_group方法，用来初始化self.param_groups。self.state的初始化需要在某个具体的优化器子类中进行。
     """
 
     r"""Base class for all optimizers.
@@ -40,13 +41,22 @@ class Optimizer(object):
         params (iterable): an iterable of :class:`torch.Tensor` s or
             :class:`dict` s. Specifies torch.Tensor)what Tensors should be optimized.
             params的数据类型有两种:
-                可迭代的torch.tensor
-                传入单个字典(dict), {"params":Iterable value}
-                传入多个字典(dict), 需要将多个dict放入一个列表容器中.
+                1、可迭代的torch.tensor
+                2、传入单个字典(dict), {"params":Iterable value}
+                3、传入多个字典(dict), 需要将多个dict放入一个列表容器中.
                     [{"params":Iterable value1}, {"params":Iterable value2}]
+                    
             Example_1:
-                >>> optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+                >>> import torch
+                >>> X = torch.tensor([1.0],requires_grad = True)
+                >>> Y = torch.tensor([2.0],requires_grad = True)
+                >>> optimizer = torch.optim.SGD([X,Y],lr =0.001)
+                >>> print(optimizer.param_groups)
+
             Example_2:
+                >>> optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+                
+            Example_3:
                 >>> optim.SGD([
                         {'params': model.base.parameters()},
                         {'params': model.classifier.parameters(), 'lr': 0.001}],
@@ -60,7 +70,7 @@ class Optimizer(object):
         torch._C._log_api_usage_once("python.optimizer")
 
         # 字典类型，defaults是所有超参数的初始值（子类传入）
-        self.defaults = defaults
+        self.defaults = defaults    # 优化器超参数，字典类型
         self._hook_for_profile()
 
         if isinstance(params, torch.Tensor):
@@ -69,8 +79,8 @@ class Optimizer(object):
                             torch.typename(params))
 
         # 将state属性设置为"defaultdict(<class 'list'>, {'':{}, '':{}})"
-        self.state = defaultdict(dict)
-
+        self.state = defaultdict(dict)  # 支持动量的模型参数，字典类型
+        # 模型参数和优化器超参数列表
         self.param_groups = []  # 将参数params转换成列表param_groups
         """
             1、params对象（传入单个dict）是一个生成器，使用list()方法将params对象转化为列表（param_groups）
@@ -190,7 +200,7 @@ class Optimizer(object):
 
     def state_dict(self):
         r"""Returns the state of the optimizer as a :class:`dict`.
-
+            将优化器管理的参数和其状态信息以 dict 形式返回
         It contains two entries:
 
         * state - a dict holding current optimization state. Its content
@@ -226,6 +236,7 @@ class Optimizer(object):
 
     def load_state_dict(self, state_dict):
         r"""Loads the optimizer state.
+        加载之前返回的 dict，更新参数和其状态
 
         Args:
             state_dict (dict): optimizer state. Should be an object returned
@@ -315,9 +326,6 @@ class Optimizer(object):
         if foreach:
             per_device_and_dtype_grads = defaultdict(lambda: defaultdict(list))
         with torch.autograd.profiler.record_function(self._zero_grad_profile_name):
-            """
-                遍历过程就是获取optimizer的param_groups属性的字典，其中的["params"]，通过遍历设定每个参数的梯度值为0。
-            """
             # 获取每一组参数
             for group in self.param_groups:
                 # 遍历当前参数组所有的params
@@ -340,6 +348,8 @@ class Optimizer(object):
                         torch._foreach_zero_(grads)
 
     def step(self, closure):
+        # 在执行optimizer.step()函数前应先执行loss.backward()函数来计算梯度。
+        # optimizer只负责通过梯度下降进行优化，而不负责产生梯度，梯度是tensor.backward()方法产生的。
         """
             step()方法负责更新参数值，但是其具体实现对于不同的优化算法是不同的，
                 所以optimizer基类只是定义了这种行为，但是并没有给出具体实现。
@@ -427,3 +437,281 @@ class Optimizer(object):
 
         # 把param_group字典存到param_groups列表
         self.param_groups.append(param_group)
+
+
+# ************************************* sgd.py **************************************
+
+import torch
+from torch import Tensor
+from .optimizer import Optimizer, required
+from typing import List, Optional
+
+"""
+    self.state每一次迭代都会更新。但是optimizer基类的step()方法并不会实现更新，
+        只是定义了step()方法，需要每一个子类step()方法自己去实现更新。这里以SGD为例介绍一下优化器的更新流程。
+
+    传统的SGD不需要使用self.state，PyTorch的SGD只有在带动量的情况下需要使用self.state。
+"""
+class SGD(Optimizer):
+    r"""Implements stochastic gradient descent (optionally with momentum).
+
+    Nesterov momentum is based on the formula from
+    `On the importance of initialization and momentum in deep learning`__.
+
+    Args:
+        params (iterable): iterable of parameters to optimize or dicts defining
+            parameter groups
+        lr (float): learning rate
+        momentum (float, optional): momentum factor (default: 0)
+        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
+        dampening (float, optional): dampening for momentum (default: 0)
+        nesterov (bool, optional): enables Nesterov momentum (default: False)
+        maximize (bool, optional): maximize the params based on the objective, instead of
+            minimizing (default: False)
+        foreach (bool, optional): whether foreach implementation of optimizer
+            is used (default: None)
+
+    Example:
+        >>> optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+        >>> optimizer.zero_grad()
+        >>> loss_fn(model(input), target).backward()
+        >>> optimizer.step()
+
+    __ http://www.cs.toronto.edu/%7Ehinton/absps/momentum.pdf
+
+    """
+
+    def __init__(self, params, lr=required, momentum=0, dampening=0,
+                 weight_decay=0, nesterov=False, *, maximize=False, foreach: Optional[bool] = None):
+        if lr is not required and lr < 0.0:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if momentum < 0.0:
+            raise ValueError("Invalid momentum value: {}".format(momentum))
+        if weight_decay < 0.0:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+
+        # 设置优化器超参数，并赋值给变量defaults（defaults是Optimizer基类的成员变量）
+        defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
+                        weight_decay=weight_decay, nesterov=nesterov,
+                        maximize=maximize, foreach=foreach)
+        if nesterov and (momentum <= 0 or dampening != 0):
+            raise ValueError("Nesterov momentum requires a momentum and zero dampening")
+        super(SGD, self).__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('nesterov', False)
+            group.setdefault('maximize', False)
+            group.setdefault('foreach', None)
+
+    """
+        step方法被@torch.no_grad()装饰器修饰，是因为需要对叶子节点做inplace操作
+
+        step方法对参数的更新主要分为三步：
+            第一步是从self.state中取出momentum_buffer转换成列表形式momentum_buffer_list。
+            第二步是对参数进行更新，同时momentum_buffer_list也会得到更新。
+            第三步是利用更新后的momentum_buffer_list对state中的momentum_buffer进行更新。
+    """
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Args:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad = []  # 存储有梯度的参数
+            d_p_list = []  # 存储参数对应的梯度
+            momentum_buffer_list = []  # 存储动量
+            has_sparse_grad = False
+
+            for p in group['params']:
+                """
+                    从self.state中取出momentum_buffer
+                    初始化momentum_buffer_list
+                    注意此时的momentum_buffer只包含过去的梯度信息
+                """
+                if p.grad is not None:
+                    params_with_grad.append(p)  # 将有梯度的参数添加到params_with_grad列表
+                    d_p_list.append(p.grad)  # 将有参数梯度添加到d_p_list列表
+                    if p.grad.is_sparse:
+                        has_sparse_grad = True
+
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        momentum_buffer_list.append(None)
+                    else:
+                        momentum_buffer_list.append(state['momentum_buffer'])
+
+            # sgd()方法对参数更新，并且更新momentum_buffer，sgd()执行完后momentum_buffer将包含过去+现在的梯度信息
+            sgd(params_with_grad,
+                d_p_list,
+                momentum_buffer_list,
+                weight_decay=group['weight_decay'],  # 正则化系数
+                momentum=group['momentum'],  # 动量系数
+                lr=group['lr'],  # 学习率
+                dampening=group['dampening'],
+                nesterov=group['nesterov'],
+                maximize=group['maximize'],
+                has_sparse_grad=has_sparse_grad,
+                foreach=group['foreach'])
+
+            # update momentum_buffers in state
+            for p, momentum_buffer in zip(params_with_grad, momentum_buffer_list):
+                """
+                    momentum_buffer_list是通过append复制操作得到state里的momentum_buffer的，
+                    所以虽然momentum_buffer_list已经更新了，但是state里的momentum_buffer还没更新
+                    所以需要同步一下，便于下一次迭代继续从state里取momentum_buffer。
+
+                    每个参数都对应一个state字典。在这里，每个参数都对应一个动量
+                """
+                state = self.state[p]
+                state['momentum_buffer'] = momentum_buffer
+
+        return loss
+
+
+def sgd(params: List[Tensor],
+        d_p_list: List[Tensor],
+        momentum_buffer_list: List[Optional[Tensor]],
+        # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+        # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+        has_sparse_grad: bool = None,
+        foreach: bool = None,
+        *,
+        weight_decay: float,
+        momentum: float,
+        lr: float,
+        dampening: float,
+        nesterov: bool,
+        maximize: bool):
+    r"""Functional API that performs SGD algorithm computation.
+
+    See :class:`~torch.optim.SGD` for details.
+    """
+
+    if foreach is None:
+        # Placeholder for more complex foreach logic to be added when value is not set
+        foreach = False
+
+    if foreach and torch.jit.is_scripting():
+        raise RuntimeError('torch.jit.script not supported with foreach optimizers')
+
+    if foreach and not torch.jit.is_scripting():
+        func = _multi_tensor_sgd
+    else:
+        func = _single_tensor_sgd
+
+    func(params,
+         d_p_list,
+         momentum_buffer_list,
+         weight_decay=weight_decay,
+         momentum=momentum,
+         lr=lr,
+         dampening=dampening,
+         nesterov=nesterov,
+         has_sparse_grad=has_sparse_grad,
+         maximize=maximize)
+
+
+def _single_tensor_sgd(params: List[Tensor],
+                       d_p_list: List[Tensor],
+                       momentum_buffer_list: List[Optional[Tensor]],
+                       *,
+                       weight_decay: float,
+                       momentum: float,
+                       lr: float,
+                       dampening: float,
+                       nesterov: bool,
+                       maximize: bool,
+                       has_sparse_grad: bool):
+    for i, param in enumerate(params):   # 遍历所有参数
+        # 取出参数对应的梯度
+        d_p = d_p_list[i]
+        if weight_decay != 0:  # 梯度加上正则项
+            d_p = d_p.add(param, alpha=weight_decay)
+        # 取出上一次迭代得到的动量（准备更新动量）
+        if momentum != 0:
+            buf = momentum_buffer_list[i]
+            # 第一次迭代时的动量初始化
+            if buf is None:
+                buf = torch.clone(d_p).detach()
+                momentum_buffer_list[i] = buf
+            else:  # 动量更新,都是inplace操作,mb*momentum_factor+(1-dampening)*grad
+                buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+            # nesterov的更新方式
+            if nesterov:
+                d_p = d_p.add(buf, alpha=momentum)
+            # 常规动量的更新方式
+            else:
+                d_p = buf
+
+        alpha = lr if maximize else -lr
+        # 参数更新
+        param.add_(d_p, alpha=alpha)
+
+
+def _multi_tensor_sgd(params: List[Tensor],
+                      grads: List[Tensor],
+                      momentum_buffer_list: List[Optional[Tensor]],
+                      *,
+                      weight_decay: float,
+                      momentum: float,
+                      lr: float,
+                      dampening: float,
+                      nesterov: bool,
+                      maximize: bool,
+                      has_sparse_grad: bool):
+    if len(params) == 0:
+        return
+
+    if has_sparse_grad is None:
+        has_sparse_grad = any([grad.is_sparse for grad in grads])
+
+    if weight_decay != 0:
+        grads = torch._foreach_add(grads, params, alpha=weight_decay)
+
+    if momentum != 0:
+        bufs = []
+
+        all_states_with_momentum_buffer = True
+        for i in range(len(momentum_buffer_list)):
+            if momentum_buffer_list[i] is None:
+                all_states_with_momentum_buffer = False
+                break
+            else:
+                bufs.append(momentum_buffer_list[i])
+
+        if all_states_with_momentum_buffer:
+            torch._foreach_mul_(bufs, momentum)
+            torch._foreach_add_(bufs, grads, alpha=1 - dampening)
+        else:
+            bufs = []
+            for i in range(len(momentum_buffer_list)):
+                if momentum_buffer_list[i] is None:
+                    buf = momentum_buffer_list[i] = torch.clone(grads[i]).detach()
+                else:
+                    buf = momentum_buffer_list[i]
+                    buf.mul_(momentum).add_(grads[i], alpha=1 - dampening)
+
+                bufs.append(buf)
+
+        if nesterov:
+            torch._foreach_add_(grads, bufs, alpha=momentum)
+        else:
+            grads = bufs
+
+    alpha = lr if maximize else -lr
+    if not has_sparse_grad:
+        torch._foreach_add_(params, grads, alpha=alpha)
+    else:
+        # foreach APIs dont support sparse
+        for i in range(len(params)):
+            params[i].add_(grads[i], alpha=alpha)
