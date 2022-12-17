@@ -1,6 +1,6 @@
-#************************************************************************************
+# ************************************************************************************
 ################################ fetch.py ##########################################
-#************************************************************************************
+# ************************************************************************************
 
 r"""Contains definitions of the methods used by the _BaseDataLoaderIter to fetch
 data from an iterable-style or map-style dataset. This logic is shared in both
@@ -48,17 +48,17 @@ class _MapDatasetFetcher(_BaseDatasetFetcher):
     def __init__(self, dataset, auto_collation, collate_fn, drop_last):
         super(_MapDatasetFetcher, self).__init__(dataset, auto_collation, collate_fn, drop_last)
 
-    def fetch(self, possibly_batched_index):    # batch_sample返回的是索引，通过该方法获取每个batch的值
-        if self.auto_collation: # self.batch_sampler一般为True
+    def fetch(self, possibly_batched_index):  # batch_sample返回的是索引，通过该方法获取每个batch的值
+        if self.auto_collation:  # self.batch_sampler一般为True
             data = [self.dataset[idx] for idx in possibly_batched_index]
         else:
             data = self.dataset[possibly_batched_index]
-        return self.collate_fn(data)    # 调用collate_fn()对batch数据进行后处理，并返回
+        return self.collate_fn(data)  # 调用collate_fn()对batch数据进行后处理，并返回
 
 
-#******************************************************************************
+# ******************************************************************************
 ################################ collate.py ##################################
-#******************************************************************************
+# ******************************************************************************
 
 r""""Contains definitions of the methods used by the _BaseDataLoaderIter workers to
 collate samples fetched from dataset into Tensor(s).
@@ -143,6 +143,8 @@ default_collate_err_msg_format = (
     "dicts or lists; found {}")
 
 """_utils.collate.default_collate"""
+
+
 def default_collate(batch):
     r"""
         Function that takes in a batch of data and puts the elements within the batch
@@ -252,9 +254,9 @@ def default_collate(batch):
     raise TypeError(default_collate_err_msg_format.format(elem_type))
 
 
-#******************************************************************************************
+# ******************************************************************************************
 ##################################### sampler.py #########################################
-#******************************************************************************************
+# ******************************************************************************************
 
 
 """
@@ -362,7 +364,7 @@ class RandomSampler(Sampler[int]):
     If with replacement, then user can specify :attr:`num_samples` to draw.
 
     Args:
-        data_source (Dataset): dataset to sample from
+        data_source (Dataset): dataset to sample from（Dataset类型数据集）
         replacement (bool): samples are drawn on-demand with replacement if ``True``, default=``False``
                         若为True，则表示可以重复采样，即同一个样本可以重复采样，这样可能导致有的样本采样不到。
         num_samples (int): number of samples to draw, default=`len(dataset)`.指定采样的样本量，默认是所有
@@ -391,11 +393,11 @@ class RandomSampler(Sampler[int]):
     def num_samples(self) -> int:
         # dataset size might change at runtime（数据集大小可能在运行时更改）
         if self._num_samples is None:
-            return len(self.data_source) # 返回随机采样的数据集样本数
-        return self._num_samples # 返回随机采样的设定的样本数量
+            return len(self.data_source)  # 未设定_num_samples，返回原数据集样本数
+        return self._num_samples  # 设定_num_samples，返回设定的样本数量设定_num_samples
 
     def __iter__(self) -> Iterator[int]:
-        n = len(self.data_source) # 获取数据集的样本数
+        n = len(self.data_source)  # 获取数据集的样本数
         if self.generator is None:
             seed = int(torch.empty((), dtype=torch.int64).random_().item())
             generator = torch.Generator()
@@ -403,9 +405,9 @@ class RandomSampler(Sampler[int]):
         else:
             generator = self.generator
 
-        if self.replacement:
+        if self.replacement:  # 若为True，则表示可以重复采样，即同一个样本可以重复采样，这样可能导致有的样本采样不到
             # 如果replacement=True，迭代获取采样器样本时，先获取迭代对象1的样本，再获取迭代对象2的样本，两者总数为self.num_samples
-            for _ in range(self.num_samples // 32): # 随机采样um_samples // 32次，每次采样32个样本，并生成迭代对象1
+            for _ in range(self.num_samples // 32):  # 随机采样um_samples // 32次，每次采样32个样本，并生成迭代对象1
                 yield from torch.randint(high=n, size=(32,), dtype=torch.int64, generator=generator).tolist()
             # 随机采样num_samples % 32个样本，并生成迭代对象2
             yield from torch.randint(high=n, size=(self.num_samples % 32,), dtype=torch.int64,
@@ -416,7 +418,7 @@ class RandomSampler(Sampler[int]):
             yield from torch.randperm(n, generator=generator).tolist()[:self.num_samples % n]
 
     def __len__(self) -> int:
-        return self.num_samples # 返回采样的样本数量
+        return self.num_samples  # 返回采样的样本数量
 
 
 class SubsetRandomSampler(Sampler[int]):
@@ -450,13 +452,17 @@ class WeightedRandomSampler(Sampler[int]):
             If not, they are drawn without replacement, which means that when a
             sample index is drawn for a row, it cannot be drawn again for that row.
         generator (Generator): Generator used in sampling.
-
-    Example:
-        >>> list(WeightedRandomSampler([0.1, 0.9, 0.4, 0.7, 3.0, 0.6], 5, replacement=True))
-        [4, 4, 1, 4, 5]
-        >>> list(WeightedRandomSampler([0.9, 0.4, 0.05, 0.2, 0.3, 0.1], 5, replacement=False))
-        [0, 1, 4, 3, 2]
     """
+
+    """
+        weights(sequence)：所有样本（整个待采样数据集）中每个样本的权重。
+            权重序列的长度可以等于数据集的长度。每个权重值则是你抽选该样本的可能性。这里的权重值大小并不需要加和为1。
+            同一个类别样本的权重值应当都设为该类别占比的倒数。比如正样本占比20%，其权重应设为 5；对应的负样本的占比为 80 ％ ，其权重应设为=1.25。
+        num_samples(int):采样数量，可以和数据集一致，也可以不一致。
+        replacement (bool) ：是否有放回抽样，一般都要放回，不仅保证数据分布没变，还能让少的那一类被重复抽到，以保证数量与多数类平衡。
+        generator (Generator) ：设定随机数生成方式
+    """
+
     weights: Tensor
     num_samples: int
     replacement: bool
@@ -488,6 +494,10 @@ class BatchSampler(Sampler[List[int]]):
 
     Args:
         sampler (Sampler or Iterable): Base sampler. Can be any iterable object
+        传入一个基采样器中：  SequentialSampler（顺序采样）
+                            RandomSampler （随机采样）
+                            SubsetRandomSampler （索引随机采样）
+                            WeightedRandomSampler （加权随机采样）
         batch_size (int): Size of mini-batch.
         drop_last (bool): If ``True``, the sampler will drop the last batch if
             its size would be less than ``batch_size``
@@ -522,20 +532,20 @@ class BatchSampler(Sampler[List[int]]):
             while True:
                 try:
                     batch = [next(sampler_iter) for _ in range(self.batch_size)]
-                    yield batch # 生成一个包含多个batch的迭代器
+                    yield batch  # 生成一个包含多个样本的batch的生成器
                 except StopIteration:
                     break
-        else:   # 如果drop_last=False，返回最后不足一个batch样本数的batch
+        else:  # 如果drop_last=False，返回最后不足一个batch样本数的batch
             batch = [0] * self.batch_size
             idx_in_batch = 0
             for idx in self.sampler:
                 batch[idx_in_batch] = idx
-                idx_in_batch += 1 # 每个batch中样本数累计，最后一组可能不足一个batch样本数
+                idx_in_batch += 1  # 每个batch中样本数累计，最后一组可能不足一个batch长度的样本数
                 if idx_in_batch == self.batch_size:
                     yield batch
-                    idx_in_batch = 0
+                    idx_in_batch = 0    # 满足一个batch长度后将batch数据清空
                     batch = [0] * self.batch_size
-            if idx_in_batch > 0: # 最后一组可能不足一个batch样本数
+            if idx_in_batch > 0:  # 最后一组可能不足一个batch长度样本数
                 yield batch[:idx_in_batch]
 
     def __len__(self) -> int:
@@ -548,9 +558,10 @@ class BatchSampler(Sampler[List[int]]):
         else:
             return (len(self.sampler) + self.batch_size - 1) // self.batch_size  # type: ignore[arg-type]
 
-#******************************************************************************************
+
+# ******************************************************************************************
 ##################################### dataloader.py ######################################
-#******************************************************************************************
+# ******************************************************************************************
 
 r"""Definition of the DataLoader and associated iterators that subclass _BaseDataLoaderIter
 
@@ -976,7 +987,7 @@ class DataLoader(Generic[T_co]):
                 # See NOTE [ Custom Samplers and IterableDataset ]
                 sampler = _InfiniteConstantSampler()
             else:  # map-style
-                if shuffle: # 如果需要自定义样本采样器更改此逻辑代码即可
+                if shuffle:  # 如果需要自定义样本采样器更改此逻辑代码即可
                     # 类RandomSampler和SequentialSampler采样器的__iter__()方法生成样本索引生成器
                     sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
                 else:
@@ -984,17 +995,18 @@ class DataLoader(Generic[T_co]):
 
         if batch_size is not None and batch_sampler is None:
             # auto_collation without custom batch_sampler
+            # 如果只有batch_size，batch_sampler是空，会自动创建一个batch_sampler
             # 这里只是实例化BatchSampler类，并没有调用类方法，所以并不会返回一个包含多个batch的迭代器（需要调用__iter__方法）
             batch_sampler = BatchSampler(sampler, batch_size, drop_last)
 
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.sampler = sampler
-        self.batch_sampler = batch_sampler # 将batch_sampler设为Dataloader成员变量
+        self.batch_sampler = batch_sampler  # 将batch_sampler设为Dataloader成员变量
         self.generator = generator
 
         if collate_fn is None:
-            if self._auto_collation:    # 通常执行self._auto_collation=True的逻辑
+            if self._auto_collation:  # batch_sampler不是None，执行该逻辑
                 collate_fn = _utils.collate.default_collate
             else:
                 collate_fn = _utils.collate.default_convert
@@ -1084,7 +1096,7 @@ class DataLoader(Generic[T_co]):
         # `.batch_sampler` if in auto-collation mode, and `.sampler` otherwise.
         # We can't change `.sampler` and `.batch_sampler` attributes for BC
         # reasons.
-        if self._auto_collation:    # 通常执行该逻辑
+        if self._auto_collation:  # 通常执行该逻辑
             return self.batch_sampler
         else:
             return self.sampler
@@ -1358,7 +1370,7 @@ class _SingleProcessDataLoaderIter(_BaseDataLoaderIter):
         data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
         if self._pin_memory:
             data = _utils.pin_memory.pin_memory(data, self._pin_memory_device)
-        return data # 逐一返回
+        return data  # 逐一返回
 
 
 class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
