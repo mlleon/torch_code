@@ -1,575 +1,10 @@
-# ************************************************************************************
-################################ fetch.py ##########################################
-# ************************************************************************************
-
-r"""Contains definitions of the methods used by the _BaseDataLoaderIter to fetch
-data from an iterable-style or map-style dataset. This logic is shared in both
-single- and multi-processing data loading.
-"""
-
-
-class _BaseDatasetFetcher(object):
-    def __init__(self, dataset, auto_collation, collate_fn, drop_last):
-        self.dataset = dataset
-        self.auto_collation = auto_collation
-        self.collate_fn = collate_fn
-        self.drop_last = drop_last
-
-    def fetch(self, possibly_batched_index):
-        raise NotImplementedError()
-
-
-class _IterableDatasetFetcher(_BaseDatasetFetcher):
-    def __init__(self, dataset, auto_collation, collate_fn, drop_last):
-        super(_IterableDatasetFetcher, self).__init__(dataset, auto_collation, collate_fn, drop_last)
-        self.dataset_iter = iter(dataset)
-        self.ended = False
-
-    def fetch(self, possibly_batched_index):
-        if self.ended:
-            raise StopIteration
-
-        if self.auto_collation:
-            data = []
-            for _ in possibly_batched_index:
-                try:
-                    data.append(next(self.dataset_iter))
-                except StopIteration:
-                    self.ended = True
-                    break
-            if len(data) == 0 or (self.drop_last and len(data) < len(possibly_batched_index)):
-                raise StopIteration
-        else:
-            data = next(self.dataset_iter)
-        return self.collate_fn(data)
-
-
-class _MapDatasetFetcher(_BaseDatasetFetcher):
-    def __init__(self, dataset, auto_collation, collate_fn, drop_last):
-        super(_MapDatasetFetcher, self).__init__(dataset, auto_collation, collate_fn, drop_last)
-
-    def fetch(self, possibly_batched_index):  # batch_sample返回的是索引，通过该方法获取每个batch的值
-        if self.auto_collation:  # self.batch_sampler一般为True
-            data = [self.dataset[idx] for idx in possibly_batched_index]
-        else:
-            data = self.dataset[possibly_batched_index]
-        return self.collate_fn(data)  # 调用collate_fn()对batch数据进行后处理，并返回
-
-
-# ******************************************************************************
-################################ collate.py ##################################
-# ******************************************************************************
-
-r""""Contains definitions of the methods used by the _BaseDataLoaderIter workers to
-collate samples fetched from dataset into Tensor(s).
-
-These **needs** to be in global scope since Py2 doesn't support serializing
-static methods.
-
-`default_collate` and `default_convert` are exposed to users via 'dataloader.py'.
-"""
-
-import torch
-import re
-import collections
-from torch._six import string_classes
-
-np_str_obj_array_pattern = re.compile(r'[SaUO]')
-
-
-def default_convert(data):
-    r"""
-        Function that converts each NumPy array element into a :class:`torch.Tensor`. If the input is a `Sequence`,
-        `Collection`, or `Mapping`, it tries to convert each element inside to a :class:`torch.Tensor`.
-        If the input is not an NumPy array, it is left unchanged.
-        This is used as the default function for collation when both `batch_sampler` and
-        `batch_size` are NOT defined in :class:`~torch.utils.data.DataLoader`.
-
-        The general input type to output type mapping is similar to that
-        of :func:`~torch.utils.data.default_collate`. See the description there for more details.
-
-        Args:
-            data: a single data point to be converted
-
-        Examples:
-            >>> # Example with `int`
-            >>> default_convert(0)
-            0
-            >>> # Example with NumPy array
-            >>> default_convert(np.array([0, 1]))
-            tensor([0, 1])
-            >>> # Example with NamedTuple
-            >>> Point = namedtuple('Point', ['x', 'y'])
-            >>> default_convert(Point(0, 0))
-            Point(x=0, y=0)
-            >>> default_convert(Point(np.array(0), np.array(0)))
-            Point(x=tensor(0), y=tensor(0))
-            >>> # Example with List
-            >>> default_convert([np.array([0, 1]), np.array([2, 3])])
-            [tensor([0, 1]), tensor([2, 3])]
-    """
-    elem_type = type(data)
-    if isinstance(data, torch.Tensor):
-        return data
-    elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
-            and elem_type.__name__ != 'string_':
-        # array of string classes and object
-        if elem_type.__name__ == 'ndarray' \
-                and np_str_obj_array_pattern.search(data.dtype.str) is not None:
-            return data
-        return torch.as_tensor(data)
-    elif isinstance(data, collections.abc.Mapping):
-        try:
-            return elem_type({key: default_convert(data[key]) for key in data})
-        except TypeError:
-            # The mapping type may not support `__init__(iterable)`.
-            return {key: default_convert(data[key]) for key in data}
-    elif isinstance(data, tuple) and hasattr(data, '_fields'):  # namedtuple
-        return elem_type(*(default_convert(d) for d in data))
-    elif isinstance(data, tuple):
-        return [default_convert(d) for d in data]  # Backwards compatibility.
-    elif isinstance(data, collections.abc.Sequence) and not isinstance(data, string_classes):
-        try:
-            return elem_type([default_convert(d) for d in data])
-        except TypeError:
-            # The sequence type may not support `__init__(iterable)` (e.g., `range`).
-            return [default_convert(d) for d in data]
-    else:
-        return data
-
-
-default_collate_err_msg_format = (
-    "default_collate: batch must contain tensors, numpy arrays, numbers, "
-    "dicts or lists; found {}")
-
-"""_utils.collate.default_collate"""
-
-
-def default_collate(batch):
-    r"""
-        Function that takes in a batch of data and puts the elements within the batch
-        into a tensor with an additional outer dimension - batch size. The exact output type can be
-        a :class:`torch.Tensor`, a `Sequence` of :class:`torch.Tensor`, a
-        Collection of :class:`torch.Tensor`, or left unchanged, depending on the input type.
-        This is used as the default function for collation when
-        `batch_size` or `batch_sampler` is defined in :class:`~torch.utils.data.DataLoader`.
-
-        Here is the general input type (based on the type of the element within the batch) to output type mapping:
-
-            * :class:`torch.Tensor` -> :class:`torch.Tensor` (with an added outer dimension batch size)
-            * NumPy Arrays -> :class:`torch.Tensor`
-            * `float` -> :class:`torch.Tensor`
-            * `int` -> :class:`torch.Tensor`
-            * `str` -> `str` (unchanged)
-            * `bytes` -> `bytes` (unchanged)
-            * `Mapping[K, V_i]` -> `Mapping[K, default_collate([V_1, V_2, ...])]`
-            * `NamedTuple[V1_i, V2_i, ...]` -> `NamedTuple[default_collate([V1_1, V1_2, ...]),
-              default_collate([V2_1, V2_2, ...]), ...]`
-            * `Sequence[V1_i, V2_i, ...]` -> `Sequence[default_collate([V1_1, V1_2, ...]),
-              default_collate([V2_1, V2_2, ...]), ...]`
-
-        Args:
-            batch: a single batch to be collated
-
-        Examples:
-            >>> # Example with a batch of `int`s:
-            >>> default_collate([0, 1, 2, 3])
-            tensor([0, 1, 2, 3])
-            >>> # Example with a batch of `str`s:
-            >>> default_collate(['a', 'b', 'c'])
-            ['a', 'b', 'c']
-            >>> # Example with `Map` inside the batch:
-            >>> default_collate([{'A': 0, 'B': 1}, {'A': 100, 'B': 100}])
-            {'A': tensor([  0, 100]), 'B': tensor([  1, 100])}
-            >>> # Example with `NamedTuple` inside the batch:
-            >>> Point = namedtuple('Point', ['x', 'y'])
-            >>> default_collate([Point(0, 0), Point(1, 1)])
-            Point(x=tensor([0, 1]), y=tensor([0, 1]))
-            >>> # Example with `Tuple` inside the batch:
-            >>> default_collate([(0, 1), (2, 3)])
-            [tensor([0, 2]), tensor([1, 3])]
-            >>> # Example with `List` inside the batch:
-            >>> default_collate([[0, 1], [2, 3]])
-            [tensor([0, 2]), tensor([1, 3])]
-    """
-
-    """
-        Dataset类__getiterm__ 经常返回的是 （img_tensor, label）,
-        所以放入 collate_fn 的 参数就是 batch=[(img_tensor, label), ....] .
-        batch[0] 就是 (img_tensor, label） ， 也就是 collections.Sequence 类型。
-    """
-    elem = batch[0]
-    elem_type = type(elem)
-    if isinstance(elem, torch.Tensor):  # 通常执行该逻辑，其它的逻辑可不管
-        out = None
-        if torch.utils.data.get_worker_info() is not None:
-            # If we're in a background process, concatenate directly into a
-            # shared memory tensor to avoid an extra copy
-            # 计算 batch 中所有 元素的个数
-            numel = sum(x.numel() for x in batch)
-            storage = elem.storage()._new_shared(numel, device=elem.device)
-            out = elem.new(storage).resize_(len(batch), *list(elem.size()))
-        return torch.stack(batch, 0, out=out)
-    elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
-            and elem_type.__name__ != 'string_':
-        if elem_type.__name__ == 'ndarray' or elem_type.__name__ == 'memmap':
-            # array of string classes and object
-            if np_str_obj_array_pattern.search(elem.dtype.str) is not None:
-                raise TypeError(default_collate_err_msg_format.format(elem.dtype))
-
-            return default_collate([torch.as_tensor(b) for b in batch])
-        elif elem.shape == ():  # scalars
-            return torch.as_tensor(batch)
-    elif isinstance(elem, float):
-        return torch.tensor(batch, dtype=torch.float64)
-    elif isinstance(elem, int):
-        return torch.tensor(batch)
-    elif isinstance(elem, string_classes):
-        return batch
-    elif isinstance(elem, collections.abc.Mapping):
-        try:
-            return elem_type({key: default_collate([d[key] for d in batch]) for key in elem})
-        except TypeError:
-            # The mapping type may not support `__init__(iterable)`.
-            return {key: default_collate([d[key] for d in batch]) for key in elem}
-    elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
-        return elem_type(*(default_collate(samples) for samples in zip(*batch)))
-    elif isinstance(elem, collections.abc.Sequence):
-        # check to make sure that the elements in batch have consistent size
-        it = iter(batch)
-        elem_size = len(next(it))
-        if not all(len(elem) == elem_size for elem in it):
-            raise RuntimeError('each element in list of batch should be of equal size')
-        transposed = list(zip(*batch))  # It may be accessed twice, so we use a list.
-
-        if isinstance(elem, tuple):
-            return [default_collate(samples) for samples in transposed]  # Backwards compatibility.
-        else:
-            try:
-                return elem_type([default_collate(samples) for samples in transposed])
-            except TypeError:
-                # The sequence type may not support `__init__(iterable)` (e.g., `range`).
-                return [default_collate(samples) for samples in transposed]
-
-    raise TypeError(default_collate_err_msg_format.format(elem_type))
-
-
-# ******************************************************************************************
-##################################### sampler.py #########################################
-# ******************************************************************************************
-
-
-"""
-Sampler类的主要职责就是提供访问dataset需要的index，可以通过Sampler类提供不同的index，从而控制数据加载的顺序。
-
-为了提高模型的泛化性，避免过拟合，每个epoch的数据加载顺序都要打乱（shuffle参数功能），
-DataLoader中配合shuffle参数自动构建一个顺序或者随机的采样器sampler，
-或者，用户也可以使用sampler参数指定一个自定义Sampler对象，每次产生下一个要获取的index。
-
-Sampler也是一个可迭代对象（iterable），PyTorch内置了以下几种Sampler：
-
-    SequentialSampler（顺序采样）
-    RandomSampler （随机采样）
-    SubsetRandomSampler （索引随机采样）
-    WeightedRandomSampler （加权随机采样）
-    BatchSampler （批采样）
-
-上面几种类型的Sampler都是继承自Sampler类，这是一个抽象类，规定Sampler的子类都必须提供__iter__方法，保证其必须是可迭代对象。
-索引随机采样和加权随机采样都是随机采样的特殊化。
-
-"""
-
-from torch import Tensor
-
-from typing import Iterator, Iterable, Optional, Sequence, List, TypeVar, Generic, Sized, Union
-
-__all__ = [
-    "BatchSampler",
-    "RandomSampler",
-    "Sampler",
-    "SequentialSampler",
-    "SubsetRandomSampler",
-    "WeightedRandomSampler",
-]
-
-T_co = TypeVar('T_co', covariant=True)
-
-
-class Sampler(Generic[T_co]):
-    r"""Base class for all Samplers.
-
-    Every Sampler subclass has to provide an :meth:`__iter__` method, providing a
-    way to iterate over indices of dataset elements, and a :meth:`__len__` method
-    that returns the length of the returned iterators.
-
-    .. note:: The :meth:`__len__` method isn't strictly required by
-              :class:`~torch.utils.data.DataLoader`, but is expected in any
-              calculation involving the length of a :class:`~torch.utils.data.DataLoader`.
-    """
-
-    def __init__(self, data_source: Optional[Sized]) -> None:
-        pass
-
-    def __iter__(self) -> Iterator[T_co]:
-        raise NotImplementedError
-
-    # NOTE [ Lack of Default `__len__` in Python Abstract Base Classes ]
-    #
-    # Many times we have an abstract class representing a collection/iterable of
-    # data, e.g., `torch.utils.data.Sampler`, with its subclasses optionally
-    # implementing a `__len__` method. In such cases, we must make sure to not
-    # provide a default implementation, because both straightforward default
-    # implementations have their issues:
-    #
-    #   + `return NotImplemented`:
-    #     Calling `len(subclass_instance)` raises:
-    #       TypeError: 'NotImplementedType' object cannot be interpreted as an integer
-    #
-    #   + `raise NotImplementedError()`:
-    #     This prevents triggering some fallback behavior. E.g., the built-in
-    #     `list(X)` tries to call `len(X)` first, and executes a different code
-    #     path if the method is not found or `NotImplemented` is returned, while
-    #     raising an `NotImplementedError` will propagate and and make the call
-    #     fail where it could have use `__iter__` to complete the call.
-    #
-    # Thus, the only two sensible things to do are
-    #
-    #   + **not** provide a default `__len__`.
-    #
-    #   + raise a `TypeError` instead, which is what Python uses when users call
-    #     a method that is not defined on an object.
-    #     (@ssnl verifies that this works on at least Python 3.7.)
-
-
-class SequentialSampler(Sampler[int]):
-    r"""Samples elements sequentially, always in the same order.
-
-    Args:
-        data_source (Dataset): dataset to sample from
-    """
-    data_source: Sized
-
-    def __init__(self, data_source: Sized) -> None:
-        self.data_source = data_source
-
-    def __iter__(self) -> Iterator[int]:
-        return iter(range(len(self.data_source)))
-
-    def __len__(self) -> int:
-        return len(self.data_source)
-
-
-class RandomSampler(Sampler[int]):
-    r"""Samples elements randomly. If without replacement, then sample from a shuffled dataset.
-    If with replacement, then user can specify :attr:`num_samples` to draw.
-
-    Args:
-        data_source (Dataset): dataset to sample from（Dataset类型数据集）
-        replacement (bool): samples are drawn on-demand with replacement if ``True``, default=``False``
-                        若为True，则表示可以重复采样，即同一个样本可以重复采样，这样可能导致有的样本采样不到。
-        num_samples (int): number of samples to draw, default=`len(dataset)`.指定采样的样本量，默认是所有
-                        若replacement=True可以设置num_samples>len(dataset)来增加采样数量，使得每个样本都尽可能被采样到。
-        generator (Generator): Generator used in sampling.
-    """
-    data_source: Sized
-    replacement: bool
-
-    def __init__(self, data_source: Sized, replacement: bool = False,
-                 num_samples: Optional[int] = None, generator=None) -> None:
-        self.data_source = data_source
-        self.replacement = replacement
-        self._num_samples = num_samples
-        self.generator = generator
-
-        if not isinstance(self.replacement, bool):
-            raise TypeError("replacement should be a boolean value, but got "
-                            "replacement={}".format(self.replacement))
-
-        if not isinstance(self.num_samples, int) or self.num_samples <= 0:
-            raise ValueError("num_samples should be a positive integer "
-                             "value, but got num_samples={}".format(self.num_samples))
-
-    @property
-    def num_samples(self) -> int:
-        # dataset size might change at runtime（数据集大小可能在运行时更改）
-        if self._num_samples is None:
-            return len(self.data_source)  # 未设定_num_samples，返回原数据集样本数
-        return self._num_samples  # 设定_num_samples，返回设定的样本数量设定_num_samples
-
-    def __iter__(self) -> Iterator[int]:
-        n = len(self.data_source)  # 获取数据集的样本数
-        if self.generator is None:
-            seed = int(torch.empty((), dtype=torch.int64).random_().item())
-            generator = torch.Generator()
-            generator.manual_seed(seed)
-        else:
-            generator = self.generator
-
-        if self.replacement:  # 若为True，则表示可以重复采样，即同一个样本可以重复采样，这样可能导致有的样本采样不到
-            # 如果replacement=True，迭代获取采样器样本时，先获取迭代对象1的样本，再获取迭代对象2的样本，两者总数为self.num_samples
-            for _ in range(self.num_samples // 32):  # 随机采样um_samples // 32次，每次采样32个样本，并生成迭代对象1
-                yield from torch.randint(high=n, size=(32,), dtype=torch.int64, generator=generator).tolist()
-            # 随机采样num_samples % 32个样本，并生成迭代对象2
-            yield from torch.randint(high=n, size=(self.num_samples % 32,), dtype=torch.int64,
-                                     generator=generator).tolist()
-        else:
-            for _ in range(self.num_samples // n):
-                yield from torch.randperm(n, generator=generator).tolist()
-            yield from torch.randperm(n, generator=generator).tolist()[:self.num_samples % n]
-
-    def __len__(self) -> int:
-        return self.num_samples  # 返回采样的样本数量
-
-
-class SubsetRandomSampler(Sampler[int]):
-    r"""Samples elements randomly from a given list of indices, without replacement.
-
-    Args:
-        indices (sequence): a sequence of indices
-        generator (Generator): Generator used in sampling.
-    """
-    indices: Sequence[int]
-
-    def __init__(self, indices: Sequence[int], generator=None) -> None:
-        self.indices = indices
-        self.generator = generator
-
-    def __iter__(self) -> Iterator[int]:
-        for i in torch.randperm(len(self.indices), generator=self.generator):
-            yield self.indices[i]
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-
-class WeightedRandomSampler(Sampler[int]):
-    r"""Samples elements from ``[0,..,len(weights)-1]`` with given probabilities (weights).
-
-    Args:
-        weights (sequence)   : a sequence of weights, not necessary summing up to one
-        num_samples (int): number of samples to draw
-        replacement (bool): if ``True``, samples are drawn with replacement.
-            If not, they are drawn without replacement, which means that when a
-            sample index is drawn for a row, it cannot be drawn again for that row.
-        generator (Generator): Generator used in sampling.
-    """
-
-    """
-        weights(sequence)：所有样本（整个待采样数据集）中每个样本的权重。
-            权重序列的长度可以等于数据集的长度。每个权重值则是你抽选该样本的可能性。这里的权重值大小并不需要加和为1。
-            同一个类别样本的权重值应当都设为该类别占比的倒数。比如正样本占比20%，其权重应设为 5；对应的负样本的占比为 80 ％ ，其权重应设为=1.25。
-        num_samples(int):采样数量，可以和数据集一致，也可以不一致。
-        replacement (bool) ：是否有放回抽样，一般都要放回，不仅保证数据分布没变，还能让少的那一类被重复抽到，以保证数量与多数类平衡。
-        generator (Generator) ：设定随机数生成方式
-    """
-
-    weights: Tensor
-    num_samples: int
-    replacement: bool
-
-    def __init__(self, weights: Sequence[float], num_samples: int,
-                 replacement: bool = True, generator=None) -> None:
-        if not isinstance(num_samples, int) or isinstance(num_samples, bool) or \
-                num_samples <= 0:
-            raise ValueError("num_samples should be a positive integer "
-                             "value, but got num_samples={}".format(num_samples))
-        if not isinstance(replacement, bool):
-            raise ValueError("replacement should be a boolean value, but got "
-                             "replacement={}".format(replacement))
-        self.weights = torch.as_tensor(weights, dtype=torch.double)
-        self.num_samples = num_samples
-        self.replacement = replacement
-        self.generator = generator
-
-    def __iter__(self) -> Iterator[int]:
-        rand_tensor = torch.multinomial(self.weights, self.num_samples, self.replacement, generator=self.generator)
-        yield from iter(rand_tensor.tolist())
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-
-class BatchSampler(Sampler[List[int]]):
-    r"""Wraps another sampler to yield a mini-batch of indices.
-
-    Args:
-        sampler (Sampler or Iterable): Base sampler. Can be any iterable object
-        传入一个基采样器中：  SequentialSampler（顺序采样）
-                            RandomSampler （随机采样）
-                            SubsetRandomSampler （索引随机采样）
-                            WeightedRandomSampler （加权随机采样）
-        batch_size (int): Size of mini-batch.
-        drop_last (bool): If ``True``, the sampler will drop the last batch if
-            its size would be less than ``batch_size``
-
-    Example:
-        >>> list(BatchSampler(SequentialSampler(range(10)), batch_size=3, drop_last=False))
-        [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
-        >>> list(BatchSampler(SequentialSampler(range(10)), batch_size=3, drop_last=True))
-        [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
-    """
-
-    def __init__(self, sampler: Union[Sampler[int], Iterable[int]], batch_size: int, drop_last: bool) -> None:
-        # Since collections.abc.Iterable does not check for `__getitem__`, which
-        # is one way for an object to be an iterable, we don't do an `isinstance`
-        # check here.
-        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or \
-                batch_size <= 0:
-            raise ValueError("batch_size should be a positive integer value, "
-                             "but got batch_size={}".format(batch_size))
-        if not isinstance(drop_last, bool):
-            raise ValueError("drop_last should be a boolean value, but got "
-                             "drop_last={}".format(drop_last))
-        self.sampler = sampler
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-
-    def __iter__(self) -> Iterator[List[int]]:
-        # Implemented based on the benchmarking in https://github.com/pytorch/pytorch/pull/76951
-        if self.drop_last:  # 如果drop_last=True，丢弃最后不足一个batch样本数的batch
-            # 这里因为没有对迭代器调用for循环，先使用iter()生成一个迭代器，然后使用next()返回样本值
-            sampler_iter = iter(self.sampler)
-            while True:
-                try:
-                    batch = [next(sampler_iter) for _ in range(self.batch_size)]
-                    yield batch  # 生成一个包含多个样本的batch的生成器
-                except StopIteration:
-                    break
-        else:  # 如果drop_last=False，返回最后不足一个batch样本数的batch
-            batch = [0] * self.batch_size
-            idx_in_batch = 0
-            for idx in self.sampler:
-                batch[idx_in_batch] = idx
-                idx_in_batch += 1  # 每个batch中样本数累计，最后一组可能不足一个batch长度的样本数
-                if idx_in_batch == self.batch_size:
-                    yield batch
-                    idx_in_batch = 0    # 满足一个batch长度后将batch数据清空
-                    batch = [0] * self.batch_size
-            if idx_in_batch > 0:  # 最后一组可能不足一个batch长度样本数
-                yield batch[:idx_in_batch]
-
-    def __len__(self) -> int:
-        # Can only be called if self.sampler has __len__ implemented
-        # We cannot enforce this condition, so we turn off typechecking for the
-        # implementation below.
-        # Somewhat related: see NOTE [ Lack of Default `__len__` in Python Abstract Base Classes ]
-        if self.drop_last:
-            return len(self.sampler) // self.batch_size  # type: ignore[arg-type]
-        else:
-            return (len(self.sampler) + self.batch_size - 1) // self.batch_size  # type: ignore[arg-type]
-
-
-# ******************************************************************************************
-##################################### dataloader.py ######################################
-# ******************************************************************************************
-
 r"""Definition of the DataLoader and associated iterators that subclass _BaseDataLoaderIter
 
 To support these two classes, in `./_utils` we define many utility methods and
 functions to be run in multiprocessing. E.g., the data loading worker loop is
 in `./_utils/worker.py`.
 """
-
+import torch.utils.data
 import functools
 import itertools
 import logging
@@ -581,29 +16,23 @@ import warnings
 
 from datetime import timedelta
 from typing import Any, Callable, Iterable, TypeVar, Generic, Sequence, List, Optional, Union
-
 import multiprocessing as python_multiprocessing
-import torch
+
 import torch.distributed as dist
 import torch.multiprocessing as multiprocessing
 import torch.utils.data.graph_settings
-
-from torch._utils import ExceptionWrapper
 from torch._six import string_classes
+from torch.utils.data.dataset import *
+from torch._utils import ExceptionWrapper
 
-from . import (
-    IterDataPipe,
-    MapDataPipe,
-    IterableDataset,
-    Sampler,
-    SequentialSampler,
-    RandomSampler,
-    BatchSampler,
-    Dataset, )
-
+from torch.utils.data.datapipes.datapipe import *
 from torch.utils.data.datapipes.datapipe import _IterDataPipeSerializationWrapper, _MapDataPipeSerializationWrapper
 
-from . import _utils
+from sampler import *
+import collate
+import fetch
+
+from torch.utils.data import _utils
 
 __all__ = [
     "DataLoader",
@@ -641,9 +70,9 @@ class _DatasetKind(object):
     @staticmethod
     def create_fetcher(kind, dataset, auto_collation, collate_fn, drop_last):
         if kind == _DatasetKind.Map:
-            return _utils.fetch._MapDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
+            return fetch._MapDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
         else:
-            return _utils.fetch._IterableDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
+            return fetch._IterableDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
 
 
 class _InfiniteConstantSampler(Sampler):
@@ -707,8 +136,8 @@ class DataLoader(Generic[T_co]):
             1、RandomSampler(dataset)或SequentialSampler(dataset)
             2、BatchSampler(sampler, batch_size, drop_last)
 
-        DataLoader只有__iter__()而没有实现__next__()，所以DataLoader是一个iterable而不是iterator。
-        这个iterator的实现在_DataLoaderIter中
+        DataLoader只有__iter__()而没有实现__next__()，所以DataLoader是一个iterable而不是iterator
+        _BaseDataLoaderIter中定义_next_index()方法，返回batch_sampler可迭代对象中的一个batch，所以是一个iterator
     """
 
     r"""
@@ -764,7 +193,7 @@ class DataLoader(Generic[T_co]):
             maintain the workers `Dataset` instances alive. (default: ``False``)
         pin_memory_device (str, optional): the data loader will copy Tensors
             into device pinned memory before returning them if pin_memory is set to true.
-    
+
     Args：
         1、dataset(Dataset)：传入的数据集
         2、batch_size(int, optional)： 每个batch有多少个样本
@@ -792,7 +221,7 @@ class DataLoader(Generic[T_co]):
             意思是运行完一个Epoch后并不会关闭worker进程，而是保持现有的worker进程继续进行下一个Epoch的数据加载。好处是Epoch之间不必重复关闭启动worker进程，加快训练速度。
             这样对训练精度是否有影响？True和False的结果似乎会略有差异。
         13、pin_memory_device (str, optional): 如果pin_memory设置为true，数据加载器将把张量拷贝到设定的设备固定内存中，然后返回它们。
-    
+
     .. warning:: If the ``spawn`` start method is used, :attr:`worker_init_fn`
                  cannot be an unpicklable object, e.g., a lambda function. See
                  :ref:`multiprocessing-best-practices` on more details related
@@ -887,7 +316,7 @@ class DataLoader(Generic[T_co]):
                 这种风格类型的dataset特别适合那些随机读取代价较大以及batch大小取决于已预读取数据的场景。
                 从实现来说，iterable风格的dataset是IterableDataset子类的实例，实现了__iter__()方法并表示数据样本的一个可迭代对象，
                 使用方法如下：调用iter(dataset)将返回从一个数据库、远程服务器或实时生成的日志中读取的数据流。
-                
+
             Note：在多进程数据加载场景中使用IterableDataset时，每个进程中的dataset对象都是重复的，
                 因此这些重复的datset对象必须使用不同的配置以避免出现重复的数据。具体请见官方IterableDataset文档查看如何使用。
         """
@@ -978,7 +407,7 @@ class DataLoader(Generic[T_co]):
             drop_last = False
         elif batch_size is None:
             # no auto_collation
-            if drop_last:
+            if drop_last:   # batch_sampler和drop_last互斥
                 raise ValueError('batch_size=None option disables auto-batching '
                                  'and is mutually exclusive with drop_last')
 
@@ -995,7 +424,7 @@ class DataLoader(Generic[T_co]):
 
         if batch_size is not None and batch_sampler is None:
             # auto_collation without custom batch_sampler
-            # 如果只有batch_size，batch_sampler是空，会自动创建一个batch_sampler
+            # 如果batch_size不为空，batch_sampler是空，会自动创建一个batch_sampler
             # 这里只是实例化BatchSampler类，并没有调用类方法，所以并不会返回一个包含多个batch的迭代器（需要调用__iter__方法）
             batch_sampler = BatchSampler(sampler, batch_size, drop_last)
 
@@ -1007,9 +436,9 @@ class DataLoader(Generic[T_co]):
 
         if collate_fn is None:
             if self._auto_collation:  # batch_sampler不是None，执行该逻辑
-                collate_fn = _utils.collate.default_collate
+                collate_fn = collate.default_collate
             else:
-                collate_fn = _utils.collate.default_convert
+                collate_fn = collate.default_convert
 
         self.collate_fn = collate_fn
         self.persistent_workers = persistent_workers
@@ -1267,12 +696,12 @@ class _BaseDataLoaderIter(object):
             shared_rng = torch.Generator()
             shared_rng.manual_seed(self._shared_seed)
             self._dataset = torch.utils.data.graph_settings.apply_shuffle_seed(self._dataset, shared_rng)
-        self._dataset_kind = loader._dataset_kind
+        self._dataset_kind = loader._dataset_kind   # 数据类型(_DatasetKind.Iterable或_DatasetKind.Map)
         self._IterableDataset_len_called = loader._IterableDataset_len_called
+        # _auto_collation是Dataloader类方法，返回self.batch_sampler is not None，即将True赋值给self._auto_collation
         self._auto_collation = loader._auto_collation
         self._drop_last = loader.drop_last
-        # _index_sampler是类Dataloader的一个装饰器属性方法，返回self.batch_sampler
-        # 将loader.batch_sampler设为类_BaseDataLoaderIter成员变量self._index_sampler（batch_sampler有__iter__()方法）
+        # _index_sampler是类Dataloader的装饰器属性方法，返回self.batch_sampler，即将self.batch_sampler赋值给self._index_sampler
         self._index_sampler = loader._index_sampler
         self._num_workers = loader.num_workers
         self._prefetch_factor = loader.prefetch_factor
@@ -1292,9 +721,8 @@ class _BaseDataLoaderIter(object):
             self._pin_memory = loader.pin_memory
             self._pin_memory_device = loader.pin_memory_device
         self._timeout = loader.timeout
-        self._collate_fn = loader.collate_fn
-        # iter()将self._index_sampler转变为一个可迭代对象，并将其赋值给类_BaseDataLoaderIter成员变量self._sampler_iter
-        self._sampler_iter = iter(self._index_sampler)
+        self._collate_fn = loader.collate_fn    # 将collate_fn的结果赋值给self._collate_fn
+        self._sampler_iter = iter(self._index_sampler)   # 将iter(self.batch_sampler)赋值给self._sampler_iter
         self._base_seed = torch.empty((), dtype=torch.int64).random_(generator=loader.generator).item()
         self._persistent_workers = loader.persistent_workers
         self._num_yielded = 0
@@ -1313,12 +741,15 @@ class _BaseDataLoaderIter(object):
             shared_rng.manual_seed(self._shared_seed)
             self._dataset = torch.utils.data.graph_settings.apply_shuffle_seed(self._dataset, shared_rng)
 
-    def _next_index(self):  # 返回batch_sampler可迭代对象中的一个batch
+    # _next_index()方法逐一返回每个batch单元索引
+    def _next_index(self):  # self._sampler_iter = iter(batch_sampler)
         return next(self._sampler_iter)  # may raise StopIteration
 
     def _next_data(self):
         raise NotImplementedError
 
+    # DataLoader只有__iter__()而没有实现__next__()，所以DataLoader是一个iterable而不是iterator
+    # _BaseDataLoaderIter中定义_next_index()方法，返回batch_sampler可迭代对象中的一个batch，所以是一个iterator
     def __next__(self) -> Any:
         with torch.autograd.profiler.record_function(self._profile_name):
             if self._sampler_iter is None:
@@ -1354,25 +785,27 @@ class _BaseDataLoaderIter(object):
         # but signalling the end is tricky without a non-blocking API
         raise NotImplementedError("{} cannot be pickled", self.__class__.__name__)
 
-
+# 单进程
 class _SingleProcessDataLoaderIter(_BaseDataLoaderIter):
     def __init__(self, loader):
         super(_SingleProcessDataLoaderIter, self).__init__(loader)
         assert self._timeout == 0
         assert self._num_workers == 0
-        # 实例化继承自_BaseDataLoaderIter的_MapDatasetFetcher对象（有fetch方法）
+        # 实例化_DatasetKind类，并调用create_fetcher方法，返回：
+        #   fetch._MapDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
+        #   即，最终是把实例化_MapDatasetFetcher类对象赋值给self._dataset_fetcher(_MapDatasetFetcher类中有fetch方法)
         self._dataset_fetcher = _DatasetKind.create_fetcher(
             self._dataset_kind, self._dataset, self._auto_collation, self._collate_fn, self._drop_last)
 
     def _next_data(self):
-        # 调用_next_index()方法逐一返回每个batch单元
+        # 调用_next_index()方法逐一返回每个batch
         index = self._next_index()  # may raise StopIteration
         data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
         if self._pin_memory:
             data = _utils.pin_memory.pin_memory(data, self._pin_memory_device)
         return data  # 逐一返回
 
-
+# 多进程
 class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
     r"""Iterates once over the DataLoader's dataset, as specified by the sampler"""
 
