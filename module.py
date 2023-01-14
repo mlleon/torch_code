@@ -2,6 +2,7 @@ from collections import OrderedDict, namedtuple
 import itertools
 import warnings
 import functools
+import torch.nn as nn
 
 import torch
 from ..parameter import Parameter
@@ -356,10 +357,8 @@ class Module:
         """
         return self.train(False)
 
-
+# 1.1.3 梯度的处理
     """
-        2、梯度的处理
-
         对于梯度的处理 nn.Module 有两个相关的函数实现，分别是 requires_grad_ 和 zero_grad 函数，
         他们都调用了 self.parameters() 来访问所有的参数，并修改参数的 requires_grad 状态 或者 清理参数的梯度。
     """
@@ -415,41 +414,46 @@ class Module:
                     p.grad = None   # 将梯度值设置为None
                 else:
                     if p.grad.grad_fn is not None:
+                        """
+                        Tensor.detach()用于从当前计算图中分离张量。它返回一个不需要梯度的新张量。
+                            当我们不需要为梯度计算跟踪张量时，我们将张量从当前计算图中分离。
+                            当我们需要将张量从 GPU 移动到 CPU 时，我们还需要分离张量。
+                        """
                         p.grad.detach_()
-                    else:
+                    else:   # 叶子节点对应的grad_fn是None
                         p.grad.requires_grad_(False)
                     p.grad.zero_()
 
-# 1.1.3 _apply()和apply()方法
+# 1.1.4 _apply()和apply()方法
+    """
+        apply 函数和 _apply 函数的区别在于，_apply() 是专门针对 parameter 和 buffer 而实现的一个“仅供内部使用”的接口，
+        但是 apply 函数是“公有”接口 。apply 实际上可以通过修改 fn 来实现 _apply 能实现的功能，同时还可以实现其他功能。
+        self._apply(lambda t: t.cuda(device))
+    """
 
     def _apply(self, fn):
         """
             def cpu()和def GPU()都是通过 self._apply(function) 配合def to()方法来实现的，
             function 一般是 lambda 表达式或其他自定义函数。因此，用户其实也可以通过 self._apply(function) 来实现一些特殊的转换。
             self._apply() 函数实际上做了如下 3 件事情，最终将 function 完整地应用于整个模块。
-                1、通过 self.children() 进行递归的调用
+                1、通过 self.children() 进行递归的调用, 实现对所有子模型都遍历一遍执行_apply()操作
                 2、对 self._parameters 中的参数及其 gradient 通过 function 进行处理
                 3、对 self._buffers 中的 buffer 逐个通过 function 来进行处理
 
-            apply 函数和 _apply 函数的区别在于，_apply() 是专门针对 parameter 和 buffer 而实现的一个“仅供内部使用”的接口，
-            但是 apply 函数是“公有”接口 。apply 实际上可以通过修改 fn 来实现 _apply 能实现的功能，同时还可以实现其他功能。
-            self._apply(lambda t: t.cuda(device))
-        """
-        """
-        其实遍历parameter，用apply也是可以实现的，不过这里还是重新写了一个_apply。
-        _apply对参数和参数的梯度都用fn处理了一遍。
-        处理完还需要用compute_should_use_set_data判断一下，是否需要替换原先的参数。
+
         """
         # 对所有子module递归调用_apply()方法
         for module in self.children():
             # 对子模块递归调用fn方法,如lambda t: t.cuda(device)方法将模型转移到GPU
             module._apply(fn)
-        """
-            在PyTorch 1.1.0之前，学习率调度程序应该在优化器更新之前调用；1.1.0以一种BC-breaking的方式改变了这种行为。
-            如果您在优化器更新（调用optimizer.step()）之前使用学习率调度程序（调用scheduler.step()），这将跳过学习率调度程序的第一个值。
-            如果您在升级到PyTorch 1.1.0之后无法复现原有结果，请检查是否在错误的时间调用了scheduler.step()。
-        """
 
+        """
+            在PyTorch 1.1.0之前，学习率调度程序需要在优化器更新之前调用，即scheduler.step() -> optimizer.step()，这将跳过学习率调度程序的第一个值。；
+            PyTorch 1.1.0以一种BC-breaking的方式改变了这种行为。如果在PyTorch 1.1.0之后无法复现原有结果，检查是否在错误的时间调用了scheduler.step()。
+            
+            compute_should_use_set_data用来决定是否change the tensor in-place，即原地修改tensor。如果是原地修改，将原来的用新的代替就好；
+            否则就在字典self._parameters中把新的tensor注册。如果参数值param有梯度param.grad，那么对param.grad也要做相同的操作。
+        """
         #   为了 BC-breaking 新增一个 tensor 类型判断
         def compute_should_use_set_data(tensor, tensor_applied):
             if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
@@ -577,10 +581,10 @@ class Module:
         """
         for module in self.children():
             module.apply(fn)  # 对该模块的子模块调用fn方法
-        fn(self)  # 对当前主模型调用fn方法
+        fn(self)  # 对当前主模块调用fn方法
         return self
 
-# 1.1.4 参数的转换或转移
+# 1.1.5 参数的转换或转移
     """
         nn.Module 实现了如下 8 个常用函数将模块转变成 float16 等类型、转移到 CPU/ GPU上。
             1、CPU：将所有 parameters 和 buffer 转移到 CPU 上
@@ -748,6 +752,12 @@ class Module:
         """
         return self._apply(lambda t: torch.empty_like(t, device=device))
 
+    """
+        函数to的作用是原地 ( in-place ) 修改Module，它可以当成三种函数来使用：
+            function:: to(device=None, dtype=None, non_blocking=False)； 
+            function:: to(dtype, non_blocking=False)； 
+            function:: to(tensor, non_blocking=False)。
+    """
     @overload
     def to(self: T, device: Optional[Union[int, device]] = ..., dtype: Optional[Union[dtype, str]] = ...,
            non_blocking: bool = ...) -> T:
@@ -1378,7 +1388,6 @@ class Module:
                     """
                     yield m  # 生成子模块信息
 
-
 # 1.2.3 路径属性访问
     def get_submodule(self, target: str) -> "Module":
         """
@@ -1541,7 +1550,6 @@ class Module:
             raise AttributeError("`" + buffer_name + "` is not a buffer")
 
         return buffer
-
 
 # 1.2.4 重构属性相关魔法方法
     def __getattr__(self, name: str) -> Union[Tensor, 'Module']:
@@ -1719,7 +1727,6 @@ class Module:
         keys = [key for key in keys if not key[0].isdigit()]
 
         return sorted(keys)
-
 
     def get_extra_state(self) -> Any:
         """
